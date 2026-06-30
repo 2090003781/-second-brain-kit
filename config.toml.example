@@ -1,0 +1,48 @@
+# =============================================================================
+# Second Brain Kit — Configuration
+# =============================================================================
+# Copy this file to config.toml, edit the values, and place it in one of:
+#   1. The same directory as the Python scripts
+#   2. ~/.second-brain/config.toml
+#
+# Alternatively, set the environment variable SECOND_BRAIN_CONFIG to point to
+# your config file, or OBSIDIAN_VAULT to point to your Obsidian vault path.
+# =============================================================================
+
+[vault]
+# Path to your Obsidian vault directory
+path = "/path/to/your/obsidian/vault"
+
+[supervisor]
+# Enable the supervisor daemon (rule-checking interceptor)
+enabled = true
+# TCP port for supervisor
+port = 49522
+
+[writer]
+# Enable the obsidian-writer daemon (writes markdown to vault)
+enabled = true
+# TCP port for writer
+port = 49520
+
+[memory]
+# Subdirectories under 记忆/ that contain rules and error patterns
+dirs = ["记忆/全局", "记忆/编程", "记忆/写作", "记忆/QQ Bot", "记忆/游戏开发"]
+
+[domains]
+# Default domain when none is specified
+default = "全局"
+
+[paths]
+# Directory for session logs (JSONL + .kw files)
+# Default: ~/.second-brain/logs
+# logs_dir = "~/.second-brain/logs"
+
+# File that stores the current session ID
+# session_file = "~/.second-brain/.current_session"
+
+# Optional: path to smart-connections-mcp external tool
+# smart_connections_mcp = ""
+
+# Optional: path to .smart-env environment directory
+# smart_env = ""
