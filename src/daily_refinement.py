@@ -66,7 +66,7 @@ def today_str() -> str:
 
 def find_topic_files(vault: Path, ref_date: str | None = None) -> list[Path]:
     """Return topic .md files modified on *ref_date* (default: yesterday)."""
-    date = ref_date or yesterday_str()
+    date = (datetime.date.today() - datetime.timedelta(days=1)) if ref_date is None else datetime.date.fromisoformat(ref_date)
     topic_dir = vault / "话题"
     if not topic_dir.is_dir():
         return []
@@ -76,8 +76,9 @@ def find_topic_files(vault: Path, ref_date: str | None = None) -> list[Path]:
             continue
         if not f.is_file():
             continue
-        # Accept files whose name starts with the date
-        if f.stem.startswith(date):
+        # Check file modification date, not filename
+        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime).date()
+        if mtime == date:
             results.append(f)
     return results
 
