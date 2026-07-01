@@ -543,7 +543,7 @@ func getTopicHandle(topicName string, topicDir string) (*os.File, string, string
 		safe = string([]rune(safe)[:80])
 	}
 
-	topicDir = filepath.Join(vaultPath, "话题")
+	os.MkdirAll(topicDir, 0755)
 	os.MkdirAll(topicDir, 0755)
 	filePath := filepath.Join(topicDir, safe+".md")
 	key := "topic:" + safe
