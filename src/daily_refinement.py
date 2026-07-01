@@ -1,4 +1,4 @@
-"""
+﻿"""
 daily_refinement.py — Daily topic-file scan and knowledge refinement.
 
 Scans yesterday's topic files in the vault, extracts inline markers,
@@ -22,6 +22,11 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+try:
+    from dedup import is_duplicate, content_hash
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from dedup import is_duplicate, content_hash
 
 # ---------------------------------------------------------------------------
 # Local config loader — same pattern as existing scripts
@@ -449,3 +454,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
