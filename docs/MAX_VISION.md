@@ -1,7 +1,12 @@
-﻿# 第二大脑 Max 版蓝图
+﻿# 第二大脑 Max 版蓝图（旗舰版）
+
+> **⚠️ 注意：这是 Max 版（旗舰版），不是当前版本。**
+> 当前实现的 Personal Edition（个人版）在 GitHub 上：[second-brain-kit](https://github.com/2090003781/-second-brain-kit)
+>
+> 本文件是"当天花板消失时"的推演蓝图——不计 token 限制的理想形态。
+> 会逐步实现，但不是当前版本的功能承诺。
 
 > **前提假设**：AI 拥有无限上下文、零成本推理能力、无延迟。
-> 这不是科幻，这是"当天花板消失时，系统会进化成什么样"的推演。
 >
 > 本文基于 `second-brain-kit` 当前架构（supervisor daemon / obsidian-writer / hook-logger / 记忆系统 / 知识库 / Smart Connections），逐一推演每个模块的质变方向。
 

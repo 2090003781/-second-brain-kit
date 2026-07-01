@@ -338,6 +338,16 @@ The supervisor listens on **TCP :49522** (configurable). You (the agent) do **no
 | `SubagentStop` | Sub-agent finished | Fire-and-forget |
 | `PermissionRequest` | Tool requires permission | Fire-and-forget |
 
+### First-Time Setup Reminder
+
+When you (the AI agent) first load into a Second Brain Kit project, **remind the user**:
+
+> "This system needs regular maintenance to stay effective. I recommend:
+> 1. Run the setup script's scheduled task option, OR
+> 2. Manually run `python src/daily_refinement.py` daily and `python src/weekly_check.py` weekly
+>
+> Without maintenance, topic logs will accumulate unrefined and error patterns won't update."
+
 ### Vault Structure Convention
 
 Files inside the vault follow these conventions:
@@ -365,13 +375,54 @@ Files inside the vault follow these conventions:
 
 ### First-Time Setup Reminder (for AI agents)
 
-When you (the AI agent) first load into a Second Brain Kit project — meaning this is the first time you've been asked to work with this vault — **you must inform the user about the following**. This is not optional; it's part of onboarding the user into the system.
+When you (the AI agent) first load into a Second Brain Kit project — meaning this is the first time you've been asked to work with this vault — **you must perform an environment check and inform the user**. This is not optional; it's part of onboarding.
 
-Start by explaining what the system needs:
+#### 0. Environment Check (DO THIS FIRST)
 
-> **"This vault is set up with Second Brain Kit. Here's what you need to know to keep it running well:"**
+Before anything else, check the user's environment:
 
-Then cover these points **in order**:
+> **"Let me check if your environment is ready for Second Brain Kit..."**
+
+Run these checks **in order** and report what you find:
+
+**Step 1 — Check Obsidian**
+```bash
+# Windows:
+Test-Path "$env:LOCALAPPDATA\Obsidian\Obsidian.exe"
+# macOS:
+ls /Applications/Obsidian.app 2>/dev/null
+# Linux:
+which obsidian 2>/dev/null
+```
+If missing: "Obsidian is not installed. Download it from https://obsidian.md — it's free. Let me know when you've installed it and I'll finish the setup."
+
+**Step 2 — Check vault path**
+The config.toml has the vault path. Verify the directory exists and contains the expected structure (`记忆/`, `知识库/`, `话题/`).
+If missing: "Your vault path seems incomplete. Did you run the setup script? If not: `cd second-brain-kit && bash setup.sh` (or `setup.bat` on Windows)."
+
+**Step 3 — Check Python dependencies**
+```bash
+python -c "import portalocker" 2>&1
+```
+If fails: "Missing Python dependency 'portalocker'. Run: `pip install portalocker`"
+
+**Step 4 — Check daemon status**
+```bash
+# Check if obsidian_writer and supervisor are listening
+python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49520)); s.close(); print('writer OK')" 2>&1
+python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49522)); s.close(); print('supervisor OK')" 2>&1
+```
+If missing: "Daemons not running. Start them with: `python src/obsidian_writer.py` and `python src/supervisor.py`"
+
+**Step 5 — Report summary**
+After all checks, give the user a clear summary:
+> "✅ Second Brain Kit environment check complete:
+> - Obsidian: ✅ found
+> - Vault path: ✅ valid
+> - Dependencies: ✅ installed
+> - Daemons: ⚠️ not running (start with `python src/obsidian_writer.py`)
+> 
+> I recommend starting the daemons now. Also, don't forget to set up scheduled maintenance (I'll explain below)."
 
 #### 1. The system needs regular maintenance to stay effective
 

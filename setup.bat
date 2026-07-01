@@ -106,6 +106,20 @@ if exist "%CONFIG_FILE%" (
     echo [OK] Config written.
 )
 
+REM ---- Optional: create scheduled maintenance tasks ----
+echo.
+echo [可选] 是否创建定时维护任务？
+echo   1) 是，创建每日提炼任务（凌晨4点）和每周自检任务（周日凌晨5点）
+echo   2) 否，稍后手动配置
+set /p SCHEDULE_CHOICE=请选择 (1/2):
+
+if "%SCHEDULE_CHOICE%"=="1" (
+    echo 创建定时任务...
+    schtasks /create /tn "SecondBrain-DailyRefinement" /tr "python %SCRIPT_DIR%daily_refinement.py" /sc daily /st 04:00 /f
+    schtasks /create /tn "SecondBrain-WeeklyCheck" /tr "python %SCRIPT_DIR%weekly_check.py" /sc weekly /d SUN /st 05:00 /f
+    echo ✅ 定时任务已创建
+)
+
 echo.
 echo =====================================================
 echo  Setup complete!
@@ -118,6 +132,9 @@ echo    2. Or copy the config to %%USERPROFILE%%\\.second-brain\\config.toml
 echo    3. Start the daemons:
 echo       python "%SCRIPT_DIR%src\obsidian_writer.py"
 echo       python "%SCRIPT_DIR%src\supervisor.py"
-echo    4. Restart Obsidian (if community plugins need the new folders)
+echo    4. (Optional) Run daily maintenance:
+echo       python "%SCRIPT_DIR%src\daily_refinement.py"
+echo       python "%SCRIPT_DIR%src\weekly_check.py"
+echo    5. Restart Obsidian (if community plugins need the new folders)
 echo.
 pause

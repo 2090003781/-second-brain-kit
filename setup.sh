@@ -96,6 +96,19 @@ TOML
     echo "[OK] Config written."
 fi
 
+# ---- Optional: create cron maintenance tasks ----
+echo ""
+echo "[Optional] Create scheduled maintenance tasks?"
+echo "  1) Yes, create daily (4am) and weekly (Sun 5am) tasks"
+echo "  2) No, I'll set them up later"
+read -rp "Choose (1/2): " SCHEDULE_CHOICE
+
+if [ "$SCHEDULE_CHOICE" = "1" ]; then
+    (crontab -l 2>/dev/null; echo "0 4 * * * cd $SCRIPT_DIR && $PYTHON src/daily_refinement.py") | crontab -
+    (crontab -l 2>/dev/null; echo "0 5 * * 0 cd $SCRIPT_DIR && $PYTHON src/weekly_check.py") | crontab -
+    echo "✅ Crontab tasks created"
+fi
+
 echo ""
 echo "====================================================="
 echo "  Setup complete!"
@@ -108,5 +121,8 @@ echo "       (add to your ~/.bashrc or ~/.zshrc)"
 echo "    2. Start the daemons:"
 echo "       $PYTHON \"$SCRIPT_DIR/src/obsidian_writer.py\" &"
 echo "       $PYTHON \"$SCRIPT_DIR/src/supervisor.py\" &"
-echo "    3. Restart Obsidian if needed."
+echo "    3. (Optional) Run daily maintenance:"
+echo "       $PYTHON \"$SCRIPT_DIR/src/daily_refinement.py\""
+echo "       $PYTHON \"$SCRIPT_DIR/src/weekly_check.py\""
+echo "    4. Restart Obsidian if needed."
 echo ""
