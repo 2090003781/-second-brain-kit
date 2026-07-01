@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +18,7 @@ import (
 var (
 	vaultPath      string
 	port           string
+	writerPort     string
 	botSessionsDir string
 	supervisionLog string
 	memoryDir      string
@@ -424,22 +425,640 @@ func isBotWindowOpen() bool {
 	return strings.Contains(string(out), "cmd.exe")
 }
 
-// ── TCP server with auto-recovery ──
-func startTCPServer() {
+// ════════════════════════════════════════════════════════════════════
+// Writer (Obsidian) — port 49520
+// ════════════════════════════════════════════════════════════════════
+
+// writerEvent is the JSON payload received on the writer TCP port.
+type writerEvent struct {
+	Event     string         `json:"event"`
+	SessionID string         `json:"session_id,omitempty"`
+	Session   string         `json:"session,omitempty"`
+	Ts        string         `json:"ts,omitempty"`
+	Cwd       string         `json:"cwd,omitempty"`
+	Model     string         `json:"model,omitempty"`
+	ToolName  string         `json:"toolName,omitempty"`
+	ToolArgs  map[string]any `json:"toolArgs,omitempty"`
+	ToolResult string        `json:"toolResult,omitempty"`
+	Prompt    string         `json:"prompt,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	Content   string         `json:"content,omitempty"`
+	Level     string         `json:"level,omitempty"`
+	Turn      int            `json:"turn,omitempty"`
+	Trigger   string         `json:"trigger,omitempty"`
+}
+
+// ── Writer state ──
+
+var (
+	// open file handles: key -> *os.File
+	openFiles   = make(map[string]*os.File)
+	openFilesMu sync.Mutex
+
+	// current topic tracking
+	currentTopic   string
+	currentTopicMu sync.Mutex
+
+	// session-level hot cache
+	sessionErrors   []string
+	sessionDecisions []string
+	sessionPrompts  []string
+	sessionTopics   []string
+	sessionMu       sync.Mutex
+)
+
+// topic marker regex: matches "── 话题分隔: xxx ──" or "-- 话题分隔：xxx --" etc.
+var topicPattern = regexp.MustCompile(`[─\-—]{2,}\s*话题分隔\s*[:：]\s*(.+?)\s*[─\-—]{2,}`)
+
+// error-like looking prefixes (lowercase)
+var errorPrefixes = []string{
+	"error:", "error ", "exception:", "traceback", "panic:", "fatal:",
+	"syntaxerror", "importerror", "typeerror", "valueerror", "keyerror",
+}
+
+func looksLikeError(text string) bool {
+	if text == "" {
+		return false
+	}
+	lower := strings.TrimLeft(strings.ToLower(text), " \t")
+	if len(lower) > 300 {
+		lower = lower[:300]
+	}
+	for _, p := range errorPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTopicMarker returns the topic name if a marker is found in text, else "".
+func parseTopicMarker(text string) string {
+	if text == "" {
+		return ""
+	}
+	m := topicPattern.FindStringSubmatch(text)
+	if len(m) > 1 {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// getRawHandle returns an open file handle for today's raw timeline.
+func getRawHandle(date time.Time) (*os.File, string) {
+	rawDir := filepath.Join(vaultPath, "reasonix-raw")
+	os.MkdirAll(rawDir, 0755)
+	dateStr := date.Format("2006-01-02")
+	filePath := filepath.Join(rawDir, dateStr+".md")
+	key := "raw:" + dateStr
+
+	openFilesMu.Lock()
+	defer openFilesMu.Unlock()
+
+	if fh, ok := openFiles[key]; ok && fh != nil {
+		return fh, filePath
+	}
+	fh, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		writeLog("writer: cannot open raw file %s: %v", filePath, err)
+		return nil, filePath
+	}
+	openFiles[key] = fh
+	return fh, filePath
+}
+
+// getTopicHandle returns an open file handle for a topic file.
+func getTopicHandle(topicName string, topicDir string) (*os.File, string, string) {
+	// sanitize filename
+	safe := topicName
+	replacer := strings.NewReplacer(
+		"\\", "", "/", "", ":", "", "*", "", "?", "", "\"", "", "<", "", ">", "", "|", "",
+	)
+	safe = replacer.Replace(safe)
+	safe = strings.TrimSpace(safe)
+	if safe == "" {
+		safe = "unknown-topic"
+	}
+	if len([]rune(safe)) > 80 {
+		safe = string([]rune(safe)[:80])
+	}
+
+	topicDir = filepath.Join(vaultPath, "话题")
+	os.MkdirAll(topicDir, 0755)
+	filePath := filepath.Join(topicDir, safe+".md")
+	key := "topic:" + safe
+
+	openFilesMu.Lock()
+	defer openFilesMu.Unlock()
+
+	if fh, ok := openFiles[key]; ok && fh != nil {
+		return fh, filePath, safe
+	}
+	fh, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		writeLog("writer: cannot open topic file %s: %v", filePath, err)
+		return nil, filePath, safe
+	}
+	openFiles[key] = fh
+	return fh, filePath, safe
+}
+
+// closeHandle closes and removes an open file handle by key.
+func closeHandle(key string) {
+	openFilesMu.Lock()
+	defer openFilesMu.Unlock()
+	if fh, ok := openFiles[key]; ok && fh != nil {
+		fh.Close()
+		delete(openFiles, key)
+	}
+}
+
+// appendFile writes text to an already-open file, ensuring it's flushed.
+func appendFile(fh *os.File, text string) {
+	if fh == nil {
+		return
+	}
+	fh.WriteString(text)
+	fh.Sync()
+}
+
+// writeHotCache writes the session hot cache to 记忆/热缓存.md.
+func writeHotCache(sessionID string) {
+	hotPath := filepath.Join(vaultPath, "记忆", "热缓存.md")
+	os.MkdirAll(filepath.Dir(hotPath), 0755)
+	now := time.Now()
+	dateStr := now.Format("2006-01-02")
+
+	sessionMu.Lock()
+	errors := copyStrings(sessionErrors)
+	decisions := copyStrings(sessionDecisions)
+	prompts := copyStrings(sessionPrompts)
+	topics := copyStrings(sessionTopics)
+	// Clear
+	sessionErrors = nil
+	sessionDecisions = nil
+	sessionPrompts = nil
+	sessionTopics = nil
+	sessionMu.Unlock()
+
+	var parts []string
+	parts = append(parts, "---\n")
+	parts = append(parts, fmt.Sprintf("updated: %s\n", dateStr))
+	parts = append(parts, "tags: [reasonix/hotcache]\n")
+	parts = append(parts, "---\n\n")
+	parts = append(parts, "# 热缓存\n\n")
+
+	if len(topics) > 0 {
+		parts = append(parts, "## 当前活跃话题\n")
+		for _, t := range topics {
+			safe := strings.NewReplacer("[", "", "]", "").Replace(t)
+			parts = append(parts, fmt.Sprintf("- [[话题/%s]] — 活跃中\n", safe))
+		}
+		parts = append(parts, "\n")
+	}
+
+	if len(decisions) > 0 {
+		parts = append(parts, "## 最近关键决策\n")
+		for _, d := range lastN(decisions, 3) {
+			parts = append(parts, fmt.Sprintf("- %s\n", d))
+		}
+		parts = append(parts, "\n")
+	}
+
+	if len(prompts) > 0 {
+		parts = append(parts, "## 待接续\n")
+		for _, p := range lastN(prompts, 3) {
+			parts = append(parts, fmt.Sprintf("- %s\n", p))
+		}
+		parts = append(parts, "\n")
+	}
+
+	if len(errors) > 0 {
+		parts = append(parts, "## 最近错误\n")
+		for _, e := range lastN(errors, 3) {
+			parts = append(parts, fmt.Sprintf("- %s\n", e))
+		}
+		parts = append(parts, "\n")
+	}
+
+	body := strings.Join(parts, "")
+	fh, err := os.OpenFile(hotPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		writeLog("writer: hot cache write error: %v", err)
+		return
+	}
+	defer fh.Close()
+	fh.WriteString(body)
+	fh.Sync()
+	writeLog("writer: hot cache written: %s", hotPath)
+}
+
+func copyStrings(src []string) []string {
+	dst := make([]string, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func lastN(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// ensureRawHeader writes the day header if the raw file is empty.
+func ensureRawHeader(fh *os.File, filePath, dateCompact string) {
+	if fh == nil {
+		return
+	}
+	info, err := os.Stat(filePath)
+	if err != nil || info.Size() == 0 {
+		appendFile(fh, fmt.Sprintf("# %s 原始时间线\n\n", dateCompact))
+	}
+}
+
+// ensureTopicHeader writes the front matter if the topic file is empty.
+func ensureTopicHeader(fh *os.File, filePath, topicName, dateCompact string) {
+	if fh == nil {
+		return
+	}
+	info, err := os.Stat(filePath)
+	if err != nil || info.Size() == 0 {
+		header := fmt.Sprintf("---\ncreated: %s\ntags: [reasonix/topic, reasonix/active]\nstatus: 活跃\n---\n\n# %s\n\n", dateCompact, topicName)
+		appendFile(fh, header)
+	}
+}
+
+// processWriterEvent handles one writer event: writes to raw timeline and topic file.
+
+var nsfwKeywords = []string{"nsfw", "NSFW", "R18", "成人", "色情", "H场景", "H事件", "18禁"}
+
+func isNSFWTopic(topicName string) bool {
+	topicLower := strings.ToLower(topicName)
+	for _, kw := range nsfwKeywords {
+		if strings.Contains(topicLower, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+func getTopicDir(topicName string) string {
+	if isNSFWTopic(topicName) {
+		return filepath.Join(vaultPath, "个人", "话题")
+	}
+	return filepath.Join(vaultPath, "话题")
+}
+
+func processWriterEvent(payload writerEvent) {
+	event := payload.Event
+	if event == "" {
+		return
+	}
+
+	// Parse timestamp
+	ts := payload.Ts
+	var dt time.Time
+	if ts != "" {
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			dt = parsed
+		} else if parsed, err := time.Parse("2006-01-02T15:04:05", ts); err == nil {
+			dt = parsed
+		} else if parsed, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
+			dt = parsed
+		} else {
+			dt = time.Now()
+		}
+	} else {
+		dt = time.Now()
+	}
+	date := dt
+	timestamp := dt.Format("15:04:05")
+	dateStr := dt.Format("2006-01-02 15:04")
+	dateCompact := dt.Format("2006-01-02")
+
+	sessionID := payload.SessionID
+	if sessionID == "" {
+		sessionID = payload.Session
+	}
+	if sessionID == "" {
+		sessionID = "unknown"
+	}
+
+	toolName := payload.ToolName
+	toolArgs := payload.ToolArgs
+	toolResult := payload.ToolResult
+	prompt := payload.Prompt
+	msg := payload.Message
+	content := payload.Content
+	level := payload.Level
+
+	// Detect topic marker from content, prompt, toolArgs, toolResult
+	topicFromMarker := ""
+	for _, src := range []string{content, prompt, mapToJSON(toolArgs), toolResult} {
+		if src != "" {
+			t := parseTopicMarker(src)
+			if t != "" {
+				topicFromMarker = t
+				break
+			}
+		}
+	}
+
+	currentTopicMu.Lock()
+	if topicFromMarker != "" {
+		currentTopic = topicFromMarker
+	}
+	curTopic := currentTopic
+	currentTopicMu.Unlock()
+
+	// Track in session
+	if curTopic != "" {
+		sessionMu.Lock()
+		found := false
+		for _, t := range sessionTopics {
+			if t == curTopic {
+				found = true
+				break
+			}
+		}
+		if !found {
+			sessionTopics = append(sessionTopics, curTopic)
+		}
+		sessionMu.Unlock()
+	}
+
+	// ── Build raw timeline entry ──
+	rawLabel := event
+	rawLine := ""
+
+	switch event {
+	case "SessionStart":
+		cwd := payload.Cwd
+		model := payload.Model
+		rawLabel = "会话开始"
+		rawLine = fmt.Sprintf("Session: %s  |  cwd: %s  |  model: %s", sessionID, cwd, model)
+
+	case "SessionEnd":
+		rawLabel = "会话结束"
+		rawLine = fmt.Sprintf("Session: %s", sessionID)
+		writeHotCache(sessionID)
+
+	case "UserPromptSubmit":
+		rawLabel = "用户提问"
+		rawLine = truncate(prompt, 300)
+		if prompt != "" {
+			sessionMu.Lock()
+			sessionPrompts = append(sessionPrompts, truncate(prompt, 120))
+			if len(sessionPrompts) > 5 {
+				sessionPrompts = sessionPrompts[1:]
+			}
+			sessionMu.Unlock()
+		}
+
+	case "PreToolUse":
+		rawLabel = "工具调用"
+		rawLine = fmt.Sprintf("%s %s", toolName, mapToJSON(toolArgs))
+
+	case "PostToolUse":
+		isErr := looksLikeError(toolResult)
+		if isErr {
+			rawLabel = "工具错误"
+		} else {
+			rawLabel = "工具结果"
+		}
+		preview := toolResult
+		if preview == "" {
+			preview = "(no return)"
+		}
+		rawLine = fmt.Sprintf("%s -> %s", toolName, truncate(preview, 200))
+		if isErr && toolName != "" {
+			errSummary := fmt.Sprintf("%s: %s", toolName, truncate(preview, 100))
+			sessionMu.Lock()
+			sessionErrors = append(sessionErrors, errSummary)
+			if len(sessionErrors) > 10 {
+				sessionErrors = sessionErrors[1:]
+			}
+			sessionMu.Unlock()
+		}
+
+	case "Stop":
+		turn := payload.Turn
+		rawLabel = "Turn 完成"
+		rawLine = fmt.Sprintf("Turn %d", turn)
+
+	case "Checkpoint":
+		rawLabel = fmt.Sprintf("检查点 (%s)", level)
+		rawLine = truncate(content, 300)
+		if content != "" {
+			sessionMu.Lock()
+			sessionDecisions = append(sessionDecisions, truncate(content, 120))
+			if len(sessionDecisions) > 8 {
+				sessionDecisions = sessionDecisions[1:]
+			}
+			sessionMu.Unlock()
+		}
+
+	case "PreCompact":
+		rawLabel = "上下文压缩"
+		trigger := payload.Trigger
+		if trigger == "" {
+			trigger = "auto"
+		}
+		rawLine = fmt.Sprintf("trigger: %s", trigger)
+
+	case "Notification":
+		rawLabel = "通知"
+		rawLine = truncate(msg, 300)
+
+	case "PostLLMCall":
+		rawLabel = "模型输出"
+		reply := toolResult
+		if reply == "" {
+			reply = payload.Message
+		}
+		rawLine = truncate(strings.ReplaceAll(reply, "\n", " "), 200)
+
+	case "SubagentStop":
+		rawLabel = "子任务完成"
+		rawLine = ""
+
+	case "PermissionRequest":
+		rawLabel = "权限请求"
+		rawLine = toolName
+
+	default:
+		rawLabel = event
+		rawLine = truncate(content, 300)
+	}
+
+	// 1) Write raw timeline
+	fhRaw, rawPath := getRawHandle(date)
+	if fhRaw != nil {
+		ensureRawHeader(fhRaw, rawPath, dateCompact)
+		rawMD := fmt.Sprintf("## %s %s\n%s\n\n", timestamp, rawLabel, rawLine)
+		appendFile(fhRaw, rawMD)
+	}
+
+	// 2) Write topic file if we have a current topic
+	if curTopic == "" {
+		return
+	}
+
+	fhTopic, topicPath, safeName := getTopicHandle(curTopic, getTopicDir(curTopic))
+	if fhTopic == nil {
+		return
+	}
+
+	ensureTopicHeader(fhTopic, topicPath, curTopic, dateCompact)
+
+	// Build topic content
+	var topicParts []string
+	topicParts = append(topicParts, fmt.Sprintf("## %s | 来自会话 %s\n\n", dateStr, sessionID))
+
+	switch event {
+	case "SessionStart":
+		cwd := payload.Cwd
+		model := payload.Model
+		topicParts = append(topicParts, fmt.Sprintf("**会话开始** | cwd: %s | model: %s\n", cwd, model))
+
+	case "SessionEnd":
+		topicParts = append(topicParts, "**→ 会话结束**\n")
+		closeHandle("topic:" + safeName)
+
+	case "UserPromptSubmit":
+		topicParts = append(topicParts, fmt.Sprintf("**用户提问:** %s\n", prompt))
+
+	case "PreToolUse":
+		argsPreview := mapToJSON(toolArgs)
+		topicParts = append(topicParts, fmt.Sprintf("**工具调用:** %s\n  参数: %s\n", toolName, truncate(argsPreview, 300)))
+
+	case "PostToolUse":
+		isErr := looksLikeError(toolResult)
+		preview := truncate(toolResult, 300)
+		if preview == "" {
+			preview = "(无返回)"
+		}
+		if isErr {
+			topicParts = append(topicParts, fmt.Sprintf("**❌ 工具错误** %s:\n  `\n%s\n  `\n", toolName, preview))
+			topicParts = append(topicParts, fmt.Sprintf("→ ❌ 错误: %s\n", truncate(toolResult, 200)))
+		} else {
+			topicParts = append(topicParts, fmt.Sprintf("**✅ 工具完成** %s → %s\n", toolName, preview))
+		}
+
+	case "Stop":
+		turn := payload.Turn
+		topicParts = append(topicParts, fmt.Sprintf("**Turn %d 完成**\n", turn))
+
+	case "Checkpoint":
+		emojiMap := map[string]string{"milestone": "🎯", "progress": "📊", "blocker": "🚧"}
+		emoji := "📌"
+		if e, ok := emojiMap[level]; ok {
+			emoji = e
+		}
+		// Remove topic markers from content
+		clean := topicPattern.ReplaceAllString(content, "")
+		clean = strings.TrimSpace(clean)
+		topicParts = append(topicParts, fmt.Sprintf("**%s 检查点 (%s):** %s\n", emoji, level, clean))
+
+	case "PreCompact":
+		trigger := payload.Trigger
+		if trigger == "" {
+			trigger = "auto"
+		}
+		topicParts = append(topicParts, fmt.Sprintf("**📦 上下文压缩** (触发: %s)\n", trigger))
+
+	case "Notification":
+		topicParts = append(topicParts, fmt.Sprintf("**通知:** %s\n", msg))
+
+	case "PostLLMCall":
+		reply := toolResult
+		if reply == "" {
+			reply = payload.Message
+		}
+		preview := truncate(strings.ReplaceAll(reply, "\n", " "), 300)
+		topicParts = append(topicParts, fmt.Sprintf("**🤖 模型输出:** %s\n", preview))
+
+	case "SubagentStop":
+		topicParts = append(topicParts, "**🔄 子任务完成**\n")
+
+	case "PermissionRequest":
+		topicParts = append(topicParts, fmt.Sprintf("**🔒 权限请求:** %s\n", toolName))
+
+	default:
+		topicParts = append(topicParts, fmt.Sprintf("**事件 %s:** %s\n", event, truncate(content, 200)))
+	}
+
+	topicParts = append(topicParts, "\n---\n\n")
+	appendFile(fhTopic, strings.Join(topicParts, ""))
+
+	if event == "SessionEnd" {
+		closeHandle("raw:" + dateCompact)
+	}
+}
+
+func mapToJSON(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
+func handleWriterConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	data := make([]byte, 65536)
+	n, err := conn.Read(data)
+	if err != nil {
+		return
+	}
+	var evt writerEvent
+	if err := json.Unmarshal(data[:n], &evt); err != nil {
+		return
+	}
+	processWriterEvent(evt)
+	conn.Write([]byte(`{"ok":true}`))
+}
+
+func startWriterServer() {
 	for {
-		listener, err := net.Listen("tcp", "127.0.0.1"+port)
+		listener, err := net.Listen("tcp", "127.0.0.1"+writerPort)
 		if err != nil {
-			writeLog("bind failed: %v, retry in 10s", err)
+			writeLog("writer bind %s failed: %v, retry in 10s", writerPort, err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		writeLog("listening on %s", port)
+		writeLog("writer listening on %s", writerPort)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				writeLog("accept error: %v, restarting listener", err)
+				writeLog("writer accept error: %v", err)
 				listener.Close()
-				break // restart the outer loop
+				break
+			}
+			go handleWriterConn(conn)
+		}
+	}
+}
+
+// ── Supervisor TCP server (port 49522) ──
+
+func startSupervisorServer() {
+	for {
+		listener, err := net.Listen("tcp", "127.0.0.1"+port)
+		if err != nil {
+			writeLog("supervisor bind %s failed: %v, retry in 10s", port, err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		writeLog("supervisor listening on %s", port)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				writeLog("supervisor accept error: %v, restarting listener", err)
+				listener.Close()
+				break
 			}
 			go handleConnection(conn)
 		}
@@ -449,7 +1068,8 @@ func startTCPServer() {
 // ── Main ──
 func main() {
 	flag.StringVar(&vaultPath, "vault", "", "Obsidian vault path")
-	flag.StringVar(&port, "port", ":49522", "TCP listen port")
+	flag.StringVar(&writerPort, "writer-port", ":49520", "Writer TCP port")
+	flag.StringVar(&port, "port", ":49522", "TCP listen port (supervisor)")
 	flag.StringVar(&botSessionsDir, "bot-dir", "", "Bot sessions directory")
 	flag.Parse()
 
@@ -463,7 +1083,7 @@ func main() {
 
 	initPaths()
 
-	// Check port conflict
+	// Check port conflict (supervisor port only; writer port checked by startWriterServer)
 	if conn, err := net.DialTimeout("tcp", "127.0.0.1"+port, 2*time.Second); err == nil {
 		conn.Close()
 		writeLog("port %s already in use, exiting", port)
@@ -510,7 +1130,9 @@ func main() {
 		}
 	}()
 
-	// TCP server with auto-recovery
-	startTCPServer()
+	// Start both TCP servers concurrently
+	go startWriterServer()
+	startSupervisorServer()
 }
+
 
