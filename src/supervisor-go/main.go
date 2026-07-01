@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	
 	"net"
 	"os"
 	"os/exec"
@@ -14,11 +14,17 @@ import (
 	"time"
 )
 
+// ── Config ──
 var (
 	vaultPath      string
 	port           string
 	botSessionsDir string
 	supervisionLog string
+	memoryDir      string
+	qqLogPath      string
+	wxLogPath      string
+	stateFile      string
+	ownLogFile     string // supervisor 自身运行日志
 )
 
 func initPaths() {
@@ -26,20 +32,27 @@ func initPaths() {
 	supervisionLog = filepath.Join(vaultPath, "监督日志.md")
 	qqLogPath = filepath.Join(vaultPath, "个人", "Bot", "QQ-Bot", "日志.md")
 	wxLogPath = filepath.Join(vaultPath, "个人", "Bot", "微信-Bot", "日志.md")
+	ownLogFile = filepath.Join(os.Getenv("USERPROFILE"), ".reasonix", "logs", "supervisor_run.log")
 }
 
-// ── Config ──
-var (
-	memoryDir   string
-	qqLogPath   string
-	wxLogPath   string
-	stateFile   string
-)
+// ── 自身日志 ──
+var logMu sync.Mutex
+
+func writeLog(format string, args ...any) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	msg := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	f, err := os.OpenFile(ownLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		f.WriteString(msg + "\n")
+		f.Close()
+	}
+}
 
 // ── Rules ──
 type Rule struct {
-	Domain   string
-	Keyword  string
+	Domain  string
+	Keyword string
 }
 
 type ErrorPattern struct {
@@ -63,10 +76,9 @@ func loadRules() {
 
 	entries, err := os.ReadDir(memoryDir)
 	if err != nil {
-		log.Printf("cannot read memory dir: %v", err)
+		writeLog("cannot read memory dir: %v", err)
 		return
 	}
-
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -75,7 +87,7 @@ func loadRules() {
 		loadRuleFile(filepath.Join(memoryDir, domain, "规则.md"), domain)
 		loadErrorFile(filepath.Join(memoryDir, domain, "高频错误.md"), domain)
 	}
-	log.Printf("loaded %d rules, %d error patterns", len(rules), len(errorPatterns))
+	writeLog("loaded %d rules, %d error patterns", len(rules), len(errorPatterns))
 }
 
 func loadRuleFile(path, domain string) {
@@ -147,14 +159,14 @@ var (
 func checkLoop(toolName string) bool {
 	loopMu.Lock()
 	defer loopMu.Unlock()
-
 	t, ok := toolTrackers[toolName]
 	if !ok {
 		toolTrackers[toolName] = &toolTracker{count: 1, lastSeen: time.Now()}
 		return false
 	}
 	if time.Since(t.lastSeen) > 5*time.Minute {
-		t.count = 1; t.lastSeen = time.Now()
+		t.count = 1
+		t.lastSeen = time.Now()
 		return false
 	}
 	t.count++
@@ -219,7 +231,8 @@ func syncBotLogs() {
 		}
 
 		var dst string
-		if strings.Contains(string(data[:min(2000, len(data))]), "花火") || strings.Contains(string(data[:min(2000, len(data))]), "Sparkle") {
+		header := string(data[:min(2000, len(data))])
+		if strings.Contains(header, "花火") || strings.Contains(header, "Sparkle") {
 			dst = wxLogPath
 		} else {
 			dst = qqLogPath
@@ -270,7 +283,9 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// ── TCP Server ──
+// ── 违规检测 ──
+var vaultPathExcluded bool // 是否已排除 vault 路径
+
 type toolEvent struct {
 	Event    string         `json:"event"`
 	ToolName string         `json:"toolName"`
@@ -282,55 +297,12 @@ type violation struct {
 	Rule          string `json:"rule,omitempty"`
 	Detail        string `json:"detail,omitempty"`
 	Solution      string `json:"solution,omitempty"`
-	Domain        string `json:"domain,omitempty"`
 	SystemMessage string `json:"systemMessage,omitempty"`
 }
 
-func checkToolCall(toolName string, toolArgs map[string]any) *violation {
-	tl := strings.ToLower(toolName)
-	if checkLoop(toolName) {
-		return &violation{
-			Violated: true, Rule: "Loop detection",
-			Detail: fmt.Sprintf("%s called 3+ times consecutively", toolName),
-			Solution: "Change approach or check preconditions first", Domain: "global",
-			SystemMessage: fmt.Sprintf("⚠️ Supervisor: loop detected on %s", toolName),
-		}
-	}
-	if tl == "bash" || tl == "echo" || tl == "powershell" || tl == "cmd" {
-		for _, v := range toolArgs {
-			if s, ok := v.(string); ok && hasChinese(s) {
-				return &violation{
-					Violated: true, Rule: "GBK encoding conflict",
-					Detail: "Command args contain CJK characters, may fail on GBK terminal",
-					Solution: "Set encoding=utf-8 or pass via env var", Domain: "global",
-					SystemMessage: fmt.Sprintf("⚠️ Supervisor: GBK encoding risk on %s", toolName),
-				}
-			}
-		}
-	}
-	if tl == "write_file" || tl == "edit_file" || tl == "read_file" {
-		if path, ok := toolArgs["path"].(string); ok {
-			if hasChinese(path) {
-				return &violation{
-					Violated: true, Rule: "Chinese file path",
-					Detail: "File path contains CJK characters, risk of encoding issues",
-					Solution: "Use ASCII paths or verify encoding", Domain: "global",
-					SystemMessage: fmt.Sprintf("⚠️ Supervisor: Chinese path on %s", toolName),
-				}
-			}
-			ext := strings.ToLower(filepath.Ext(path))
-			if tl == "write_file" && (ext == ".toml" || ext == ".json" || ext == ".yaml" || ext == ".yml") {
-				return &violation{
-					Violated: true, Rule: "Backup before overwrite",
-					Detail: fmt.Sprintf("Writing %s without backup", path),
-					Solution: fmt.Sprintf("Run: Copy-Item '%s' '%s.bak' first", path, path),
-					Domain: "global",
-					SystemMessage: fmt.Sprintf("⚠️ Supervisor: backup required for %s", path),
-				}
-			}
-		}
-	}
-	return nil
+func isVaultPath(s string) bool {
+	abs, _ := filepath.Abs(s)
+	return strings.Contains(abs, vaultPath) || strings.Contains(abs, "个人数据\\辞玖")
 }
 
 func hasChinese(s string) bool {
@@ -340,6 +312,61 @@ func hasChinese(s string) bool {
 		}
 	}
 	return false
+}
+
+func checkToolCall(toolName string, toolArgs map[string]any) *violation {
+	tl := strings.ToLower(toolName)
+
+	// Loop detection
+	if checkLoop(toolName) {
+		return &violation{
+			Violated: true, Rule: "Loop detection",
+			Detail:      fmt.Sprintf("%s called 3+ times", toolName),
+			Solution:    "Change approach or check preconditions",
+			SystemMessage: fmt.Sprintf("⚠️ Supervisor: loop detected on %s", toolName),
+		}
+	}
+
+	// GBK encoding check - skip if args contain vault path
+	if tl == "bash" || tl == "echo" || tl == "powershell" || tl == "cmd" {
+		for _, v := range toolArgs {
+			if s, ok := v.(string); ok && hasChinese(s) && !isVaultPath(s) {
+				return &violation{
+					Violated: true, Rule: "GBK encoding",
+					Detail:   "Command args contain CJK chars outside vault path",
+					Solution: "Set encoding=utf-8 or pass via env var",
+					SystemMessage: fmt.Sprintf("⚠️ Supervisor: GBK risk on %s", toolName),
+				}
+			}
+		}
+	}
+
+	// Chinese path check - skip vault paths
+	if tl == "write_file" || tl == "edit_file" || tl == "read_file" || tl == "glob" || tl == "grep" {
+		if p, ok := toolArgs["path"].(string); ok {
+			if hasChinese(p) && !isVaultPath(p) {
+				return &violation{
+					Violated: true, Rule: "Chinese file path",
+					Detail:   "CJK path outside vault",
+					Solution: "Use ASCII paths or verify encoding",
+					SystemMessage: fmt.Sprintf("⚠️ Supervisor: Chinese path on %s", toolName),
+				}
+			}
+			// Backup check
+			if tl == "write_file" {
+				ext := strings.ToLower(filepath.Ext(p))
+				if ext == ".toml" || ext == ".json" || ext == ".yaml" || ext == ".yml" {
+					return &violation{
+						Violated: true, Rule: "Backup before overwrite",
+						Detail:   fmt.Sprintf("Writing %s without backup", p),
+						Solution:  fmt.Sprintf("Copy-Item '%s' '%s.bak'", p, p),
+						SystemMessage: fmt.Sprintf("⚠️ Supervisor: backup %s", p),
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func handleConnection(conn net.Conn) {
@@ -388,9 +415,40 @@ func isReasonixRunning() bool {
 	return strings.Contains(string(out), "reasonix.exe")
 }
 
+func isBotWindowOpen() bool {
+	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq cmd.exe", "/NH")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "cmd.exe")
+}
+
+// ── TCP server with auto-recovery ──
+func startTCPServer() {
+	for {
+		listener, err := net.Listen("tcp", "127.0.0.1"+port)
+		if err != nil {
+			writeLog("bind failed: %v, retry in 10s", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		writeLog("listening on %s", port)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				writeLog("accept error: %v, restarting listener", err)
+				listener.Close()
+				break // restart the outer loop
+			}
+			go handleConnection(conn)
+		}
+	}
+}
+
 // ── Main ──
 func main() {
-	flag.StringVar(&vaultPath, "vault", "", "Obsidian vault path (default: D:\\个人数据\\辞玖)")
+	flag.StringVar(&vaultPath, "vault", "", "Obsidian vault path")
 	flag.StringVar(&port, "port", ":49522", "TCP listen port")
 	flag.StringVar(&botSessionsDir, "bot-dir", "", "Bot sessions directory")
 	flag.Parse()
@@ -401,43 +459,34 @@ func main() {
 	if botSessionsDir == "" {
 		botSessionsDir = "C:\\Users\\20900\\AppData\\Roaming\\reasonix\\projects\\C--Users-20900-DeepSeek-Reasonix\\sessions"
 	}
-
-	initPaths()
 	stateFile = filepath.Join(os.Getenv("USERPROFILE"), ".reasonix", "logs", "bot_sync_state.json")
 
-	log.SetPrefix("[supervisor] ")
-	log.SetFlags(log.Ltime | log.Lmsgprefix)
+	initPaths()
 
 	// Check port conflict
 	if conn, err := net.DialTimeout("tcp", "127.0.0.1"+port, 2*time.Second); err == nil {
 		conn.Close()
-		log.Println("port already in use, another instance running")
+		writeLog("port %s already in use, exiting", port)
 		os.Exit(0)
 	}
 
 	loadRules()
 	loadBotState()
 
-	listener, err := net.Listen("tcp", "127.0.0.1"+port)
-	if err != nil {
-		log.Fatalf("bind failed: %v", err)
-	}
-	defer listener.Close()
-
-	log.Printf("running on %s, vault: %s", port, vaultPath)
-
-	// Lifecycle monitor: exit when no reasonix.exe running
+	// Lifecycle: exit only when BOTH reasonix desktop AND bot window are closed
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			if !isReasonixRunning() {
-				log.Println("no reasonix.exe running, shutting down")
+			running := isReasonixRunning()
+			botOpen := isBotWindowOpen()
+			if !running && !botOpen {
+				writeLog("no reasonix.exe and no bot window, shutting down")
 				os.Exit(0)
 			}
 		}
 	}()
 
-	// Bot log sync every 2 seconds
+	// Bot sync every 2s
 	go func() {
 		for {
 			syncBotLogs()
@@ -445,7 +494,7 @@ func main() {
 		}
 	}()
 
-	// Reload rules every 5 minutes
+	// Reload rules every 5min
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
@@ -453,11 +502,15 @@ func main() {
 		}
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			continue
+	// Health report every 30min
+	go func() {
+		for {
+			time.Sleep(30 * time.Minute)
+			writeLog("health: running, rules=%d errors=%d", len(rules), len(errorPatterns))
 		}
-		go handleConnection(conn)
-	}
+	}()
+
+	// TCP server with auto-recovery
+	startTCPServer()
 }
+
