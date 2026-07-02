@@ -1,457 +1,356 @@
 ﻿"""
-daily_refinement.py — Daily topic-file scan and knowledge refinement.
+daily_refinement.py — Topic-file scanner for structured log format v2.
 
-Scans yesterday's topic files in the vault, extracts inline markers,
-compares with known error/rule files, updates them, and generates a
-daily refinement report under 日报/.
-
-Configuration:
-  - vault path from config.toml (via config.py)
-  - memory dirs from config.toml (memory.dirs)
-
+Reads topic files, extracts structured markers ([DECISION]/[ERROR]/[PREFERENCE]/[PENDING]/[TRIGGER]),
+updates error library and habit library, generates daily report.
 Usage:
-    python src/daily_refinement.py          # normal run
-    python src/daily_refinement.py --dry-run  # preview only, no writes
+    python src/daily_refinement.py
+    python src/daily_refinement.py --dry-run
 """
 
-from __future__ import annotations
-
-import argparse
-import datetime
-import re
-import sys
+import argparse, datetime, json, re, sys
 from pathlib import Path
-from typing import Any
-try:
-    from dedup import is_duplicate, content_hash
-except ImportError:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from dedup import is_duplicate, content_hash
 
-# ---------------------------------------------------------------------------
-# Local config loader — same pattern as existing scripts
-# ---------------------------------------------------------------------------
-try:
-    from config import load_config, vault_path
-except ImportError:
-    # Allow running from src/ directly
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from config import load_config, vault_path  # type: ignore[import-not-found]
+def load_config():
+    vault = Path("D:/个人数据/辞玖")
+    return {
+        "vault": vault,
+        "topics_dir": vault / "话题",
+        "errors_file": vault / "记忆" / "错误库.md",
+        "habits_file": vault / "记忆" / "习惯库.md",
+        "daily_dir": vault / "日报",
+    }
 
+# ── New format patterns ──
+# Line format: - 日期 | [TYPE: summary | field: value | ...]
+DECISION_RE = re.compile(
+    r'\[DECISION:\s*(.+?)(?:\s*\|\s*context:\s*(.+?))?(?:\s*\|\s*scope:\s*(.+?))?\]',
+    re.IGNORECASE
+)
+ERROR_RE = re.compile(
+    r'\[ERROR:\s*(.+?)(?:\s*\|\s*resolution:\s*(.+?))?(?:\s*\|\s*tool:\s*(.+?))?(?:\s*\|\s*fixed:\s*(.+?))?\]',
+    re.IGNORECASE
+)
+PREFERENCE_RE = re.compile(
+    r'\[PREFERENCE:\s*(.+?)(?:\s*\|\s*context:\s*(.+?))?(?:\s*\|\s*source:\s*(.+?))?\]',
+    re.IGNORECASE
+)
+PENDING_RE = re.compile(
+    r'\[PENDING:\s*(.+?)(?:\s*\|\s*context:\s*(.+?))?\]',
+    re.IGNORECASE
+)
+TRIGGER_RE = re.compile(
+    r'\[TRIGGER:\s*(.+?)(?:\s*\|\s*action:\s*(.+?))?(?:\s*\|\s*summary:\s*(.+?))?\]',
+    re.IGNORECASE
+)
 
-# ---------------------------------------------------------------------------
-# Constants — marker patterns
-# ---------------------------------------------------------------------------
-
-# Line markers we look for in topic files
-MARKERS = {
-    "❌ 错误": re.compile(r"→ ❌ 错误:\s*(.+)"),
-    "💡 经验": re.compile(r"→ 💡 经验:\s*(.+)"),
-    "♻️ 可复用": re.compile(r"→ ♻️ 可复用:\s*(.+)"),
-    "📌 记录": re.compile(r"→ 📌 记录:\s*(.+)"),
-}
-
-# Memory file names (relative to each domain dir)
-MEMORY_ERROR_FILE = "高频错误.md"
-MEMORY_RULE_FILE = "规则.md"
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def yesterday_str() -> str:
-    """Return 'YYYY-MM-DD' for yesterday."""
-    return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+# ── Legacy format patterns (旧格式兼容) ──
+LEGACY_DECISION = re.compile(r'决策：(.+)')
+LEGACY_PREFERENCE = re.compile(r'偏好：(.+)')
+LEGACY_PENDING = re.compile(r'待续：(.+)')
+LEGACY_ERR = re.compile(r'\[err:\s*([^\]]+)\]')
+LEGACY_TRIGGER = re.compile(r'触发\s*\|\s*\*\*\s*(.+?)(?:\s+(\w+)\s*\{)?')
 
 
-def today_str() -> str:
-    return datetime.date.today().isoformat()
+def parse_entry_line(line: str, ref_date: str) -> dict | None:
+    """Parse a single entry line. Returns dict with type and fields, or None."""
+    line = line.strip()
+    if not line.startswith("- " + ref_date):
+        return None
 
-
-def find_topic_files(vault: Path, ref_date: str | None = None) -> list[Path]:
-    """Return topic .md files modified on *ref_date* (default: yesterday)."""
-    date = (datetime.date.today() - datetime.timedelta(days=1)) if ref_date is None else datetime.date.fromisoformat(ref_date)
-    topic_dir = vault / "话题"
-    if not topic_dir.is_dir():
-        return []
-    results: list[Path] = []
-    for f in topic_dir.iterdir():
-        if f.suffix.lower() != ".md":
-            continue
-        if not f.is_file():
-            continue
-        # Check file modification date, not filename
-        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime).date()
-        if mtime == date:
-            results.append(f)
-    return results
-
-
-def extract_markers(content: str) -> dict[str, list[str]]:
-    """Scan *content* for marker lines and group by type."""
-    found: dict[str, list[str]] = {k: [] for k in MARKERS}
-    for line in content.splitlines():
-        for label, pattern in MARKERS.items():
-            m = pattern.search(line)
+    # Try new format first
+    for cls, pat, marker in [
+        ("DECISION", DECISION_RE, "[DECISION"),
+        ("ERROR", ERROR_RE, "[ERROR"),
+        ("PREFERENCE", PREFERENCE_RE, "[PREFERENCE"),
+        ("PENDING", PENDING_RE, "[PENDING"),
+        ("TRIGGER", TRIGGER_RE, "[TRIGGER"),
+    ]:
+        if marker.lower() in line.lower():
+            m = pat.search(line)
             if m:
-                found[label].append(m.group(1).strip())
-    return found
+                return {"type": cls, "groups": m.groups(), "raw": line}
 
+    # Legacy fallback
+    if "决策：" in line:
+        m = LEGACY_DECISION.search(line)
+        if m:
+            return {"type": "DECISION", "groups": (m.group(1), None, None), "raw": line}
+    if "偏好：" in line:
+        m = LEGACY_PREFERENCE.search(line)
+        if m:
+            return {"type": "PREFERENCE", "groups": (m.group(1), None, None), "raw": line}
+    if "[err:" in line:
+        m = LEGACY_ERR.search(line)
+        if m:
+            return {"type": "ERROR", "groups": (m.group(1), None, None, None), "raw": line}
+    if "待续：" in line:
+        m = LEGACY_PENDING.search(line)
+        if m:
+            return {"type": "PENDING", "groups": (m.group(1), None), "raw": line}
+    if "触发" in line:
+        m = LEGACY_TRIGGER.search(line)
+        if m:
+            summary = m.group(1)[:60] if m.group(1) else ""
+            return {"type": "TRIGGER", "groups": (summary, m.group(2) or "", ""), "raw": line}
 
-def load_memory_dirs(cfg: dict[str, Any]) -> list[Path]:
-    """Return resolved Paths for each memory domain directory."""
-    vault = _resolve_vault(cfg)
-    raw_dirs: list[str] = cfg.get("memory", {}).get("dirs", ["记忆/全局"])
-    return [vault / d for d in raw_dirs]
-
-
-def _resolve_vault(cfg: dict[str, Any]) -> Path:
-    """Get the vault path from config or environment."""
-    vp = vault_path()
-    if vp and vp.is_dir():
-        return vp
-    # fallback: try config["vault"]["path"] directly
-    raw = cfg.get("vault", {}).get("path", "")
-    if raw:
-        return Path(raw).expanduser().resolve()
-    print("[daily_refinement] WARNING: vault path not found; using CWD", file=sys.stderr)
-    return Path.cwd()
-
-
-# ---------------------------------------------------------------------------
-# Memory file operations
-# ---------------------------------------------------------------------------
-
-
-def _parse_error_count(line: str) -> int | None:
-    """Parse '- **次数：** N' from a line, return N or None."""
-    m = re.search(r"\*\*次数：\*\*\s*(\d+)", line)
-    return int(m.group(1)) if m else None
-
-
-def _update_error_count(file_path: Path, error_keyword: str) -> str | None:
-    """
-    Increment the count for an existing error matching *error_keyword*.
-    Returns None if no match found, or a summary string if updated.
-    """
-    if not file_path.is_file():
-        return None
-    content = file_path.read_text("utf-8")
-    lines = content.splitlines()
-
-    # Try to find a section that contains the keyword
-    section_start: int | None = None
-    count_line_idx: int | None = None
-    for i, line in enumerate(lines):
-        if line.startswith("## ") and error_keyword.lower() in line.lower():
-            section_start = i
-        if section_start is not None and i > section_start:
-            cnt = _parse_error_count(line)
-            if cnt is not None:
-                count_line_idx = i
-                break
-
-    if count_line_idx is None:
-        return None
-
-    new_count = _parse_error_count(lines[count_line_idx])
-    if new_count is None:
-        return None
-    lines[count_line_idx] = re.sub(
-        r"(\*\*次数：\*\*\s*)\d+",
-        rf"\g<1>{new_count + 1}",
-        lines[count_line_idx],
-    )
-    file_path.write_text("\n".join(lines) + "\n", "utf-8")
-    return f"已知错误，次数+1 → 累计{new_count + 1}次"
-
-
-def _append_new_error(file_path: Path, domain: str, content_text: str) -> str:
-    """Append a new error entry to the error file."""
-    # Determine max error number
-    if file_path.is_file():
-        text = file_path.read_text("utf-8")
-        nums = [int(m) for m in re.findall(r"^## #(\d+)", text, re.MULTILINE)]
-        next_num = max(nums) + 1 if nums else 1
-    else:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        next_num = 1
-        text = f"# High-Frequency Errors — {domain} Domain\n\n---\n"
-
-    entry = (
-        f"\n## #{next_num} — {content_text[:60]}\n\n"
-        f"- **次数：** 1\n"
-        f"- **现象：** {content_text}\n"
-        f"- **解决：** (pending refinement)\n\n---\n"
-    )
-
-    with file_path.open("a", encoding="utf-8") as f:
-        f.write(entry)
-    return f"新增1条"
-
-
-def _find_similar_rule(file_path: Path, content_text: str) -> str | None:
-    """Check if a rule file already has a rule similar to *content_text*."""
-    if not file_path.is_file():
-        return None
-    text = file_path.read_text("utf-8")
-    # Simple keyword overlap check
-    keywords = set(re.findall(r"\S+", content_text))
-    for line in text.splitlines():
-        line_keywords = set(re.findall(r"\S+", line))
-        overlap = keywords & line_keywords
-        if len(overlap) >= 3:  # at least 3 words in common
-            return line.strip()
     return None
 
 
-def _append_new_rule(file_path: Path, domain: str, content_text: str) -> str:
-    """Append a new rule derived from experience."""
-    if file_path.is_file():
-        text = file_path.read_text("utf-8")
-        nums = [int(m) for m in re.findall(r"^## Rule (\d+)", text, re.MULTILINE)]
-        next_num = max(nums) + 1 if nums else 1
-    else:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        next_num = 1
-        text = f"# Rules — {domain} Domain\n\n"
-
-    rule_entry = (
-        f"\n## Rule {next_num} — {content_text[:50]}\n\n"
-        f"1. **Derived from experience**: {content_text}\n"
-    )
-
-    with file_path.open("a", encoding="utf-8") as f:
-        f.write(rule_entry)
-    return f"写入 {domain}/规则.md"
+def scan_topics(cfg, ref_date):
+    results = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
+    for f in sorted(cfg["topics_dir"].glob("*.md")):
+        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime).date()
+        if mtime.isoformat() != ref_date:
+            continue
+        text = f.read_text("utf-8", errors="replace")
+        for line in text.split("\n"):
+            entry = parse_entry_line(line, ref_date)
+            if entry:
+                results[entry["type"]].append(entry)
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
+def generate_report(cfg, ref_date, results):
+    report_dir = cfg["daily_dir"]
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_file = report_dir / f"{ref_date}.md"
 
+    # Read existing content (entries written by writer.go during the day)
+    existing_extra = []
+    if report_file.exists():
+        existing_text = report_file.read_text("utf-8", errors="replace")
+        # Keep lines that are writer.go additions (after the report header)
+        in_extra = False
+        for line in existing_text.split("\n"):
+            if line.startswith("## 关键记录") or line.startswith("## "):
+                in_extra = True
+                continue
+            if in_extra and line.strip().startswith("- [") and line.strip().endswith("]"):
+                # Only keep if not already in today's results
+                keep = True
+                for key in results:
+                    for entry in results[key]:
+                        if entry["raw"].strip() == line.strip():
+                            keep = False
+                            break
+                    if not keep:
+                        break
+                if keep:
+                    existing_extra.append(line.strip())
 
-def process_vault(cfg: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
-    """
-    Main pipeline.
+    lines = [f"# {ref_date} 日报\n"]
 
-    Returns a report dict structured for the daily markdown output.
-    """
-    vault = _resolve_vault(cfg)
-    ref_date = yesterday_str()
-    topic_files = find_topic_files(vault, ref_date)
-    memory_dirs = load_memory_dirs(cfg)
-
-    report: dict[str, Any] = {
-        "date": ref_date,
-        "audit_records": [],  # list of {type, content, action}
-        "updates": [],        # list of "更新了 ..."
-        "pending": [],        # list of pending-review items
-        "errors": [],
+    # Map internal types to display labels
+    display_map = {
+        "DECISION": ("决策", "决策"),
+        "ERROR": ("错误", "错误"),
+        "PREFERENCE": ("偏好", "偏好"),
+        "PENDING": ("待续", "待续"),
+        "TRIGGER": ("话题触发", "话题触发"),
     }
 
-    if not topic_files:
-        report["errors"].append(f"没有找到 {ref_date} 的话题文件")
-        return report
-
-    # Collect all markers from topic files
-    all_markers: dict[str, list[str]] = {k: [] for k in MARKERS}
-    for tf in topic_files:
-        content = tf.read_text("utf-8", errors="replace")
-        extracted = extract_markers(content)
-        for k in all_markers:
-            all_markers[k].extend(extracted[k])
-
-    # Process each marker type
-    for label, items in all_markers.items():
-        for item in items:
-            action = _classify_and_update(item, label, memory_dirs, dry_run)
-            record = {"type": label, "content": item, "action": action}
-            report["audit_records"].append(record)
-            if action.startswith("待分类"):
-                report["pending"].append(f"「{item}」→ 可能是{label}？待周自检确认")
-            elif action.startswith("更新了"):
-                report["updates"].append(action)
-
-    return report
-
-
-def _classify_and_update(
-    item: str, label: str, memory_dirs: list[Path], dry_run: bool
-) -> str:
-    """
-    Determine what to do with a marker item.
-
-    Returns a human-readable action string.
-    """
-    # ---- Errors go to 高频错误.md ----
-    if label == "❌ 错误":
-        for d in memory_dirs:
-            err_file = d / MEMORY_ERROR_FILE
-            if dry_run and err_file.is_file():
-                # Check if it would match
-                text = err_file.read_text("utf-8")
-                if item.lower() in text.lower():
-                    return f"[DRY-RUN] 已知错误（匹配 {d.name}），次数+1"
-            if not dry_run:
-                result = _update_error_count(err_file, item)
-                if result:
-                    return f"已知错误，{result} → {d.name}"
-        # Not found in any domain — append to default domain
-        default_domain = memory_dirs[0] if memory_dirs else Path()
-        err_file = default_domain / MEMORY_ERROR_FILE
-        if dry_run:
-            return f"[DRY-RUN] 新错误 → 将写入 {default_domain.name}/高频错误.md"
-        summary = _append_new_error(err_file, default_domain.name, item)
-        return f"新错误 → {summary}（{default_domain.name}）"
-
-    # ---- Experience → 规则.md ----
-    if label == "💡 经验":
-        for d in memory_dirs:
-            rule_file = d / MEMORY_RULE_FILE
-            similar = _find_similar_rule(rule_file, item) if rule_file.is_file() else None
-            if similar:
-                if dry_run:
-                    return f"[DRY-RUN] 已有类似规则（{d.name}），将合并"
-                return f"已有类似规则（{d.name}），已合并"
-        # New experience — write to default domain
-        default_domain = memory_dirs[0] if memory_dirs else Path()
-        rule_file = default_domain / MEMORY_RULE_FILE
-        if dry_run:
-            return f"[DRY-RUN] 新经验 → 将写入 {default_domain.name}/规则.md"
-        summary = _append_new_rule(rule_file, default_domain.name, item)
-        return f"新经验 → {summary}"
-
-    # ---- Reusable process → 规则.md (as a process note) ----
-    if label == "♻️ 可复用":
-        default_domain = memory_dirs[0] if memory_dirs else Path()
-        rule_file = default_domain / MEMORY_RULE_FILE
-        similar = _find_similar_rule(rule_file, item) if rule_file.is_file() else None
-        if similar:
-            if dry_run:
-                return f"[DRY-RUN] 已有类似流程（{default_domain.name}），将合并"
-            return f"已有类似流程（{default_domain.name}），已合并"
-        if dry_run:
-            return f"[DRY-RUN] 新流程 → 将写入 {default_domain.name}/规则.md"
-        summary = _append_new_rule(rule_file, default_domain.name, f"[流程] {item}")
-        return f"新流程 → {summary}"
-
-    # ---- Uncategorised record → pending review ----
-    if label == "📌 记录":
-        return "待分类 → 转入周自检"
-
-    return "未处理"
-
-
-# ---------------------------------------------------------------------------
-# Report generation
-# ---------------------------------------------------------------------------
-
-
-def generate_report_md(report: dict[str, Any]) -> str:
-    """Render the report dict as a Markdown string."""
-    lines: list[str] = []
-    lines.append(f"# {report['date']} 日提炼报告")
-    lines.append("")
-
-    # Audit records table
-    lines.append("## 审核记录")
-    lines.append("| 类型 | 内容 | 处理 |")
-    lines.append("|------|------|------|")
-    for rec in report["audit_records"]:
-        # Escape pipes in content
-        content = rec["content"].replace("|", "\\|")
-        action = rec["action"].replace("|", "\\|")
-        lines.append(f"| {rec['type']} | {content} | {action} |")
-
-    lines.append("")
-
-    # Associated updates
-    lines.append("## 关联更新")
-    if report["updates"]:
-        for u in report["updates"]:
-            lines.append(f"- {u}")
+    total = sum(len(v) for v in results.values())
+    if total == 0 and not existing_extra:
+        lines.append("无记录\n")
     else:
-        lines.append("- 无更新")
-    lines.append("")
+        for key, (zh_label, _) in display_map.items():
+            entries = results.get(key, [])
+            if entries:
+                lines.append(f"\n## {zh_label}\n")
+                for e in entries:
+                    summary = e["groups"][0] if e["groups"] and e["groups"][0] else e["raw"]
+                    lines.append(f"- {summary.strip()}\n")
 
-    # Pending review
-    lines.append("## 待审")
-    if report["pending"]:
-        for p in report["pending"]:
-            lines.append(f"- {p}")
-    else:
-        lines.append("- 无待审项")
-    lines.append("")
+    # Append writer.go additions that weren't captured by topic scan
+    if existing_extra:
+        lines.append(f"\n## 其他记录\n")
+        for extra in existing_extra:
+            lines.append(f"{extra}\n")
 
-    # Errors / warnings
-    if report["errors"]:
-        lines.append("## 备注")
-        for e in report["errors"]:
-            lines.append(f"- ⚠️ {e}")
-        lines.append("")
-
-    return "\n".join(lines)
+    report_file.write_text("".join(lines), "utf-8")
+    return report_file
 
 
-def write_report(report: dict[str, Any], vault: Path, dry_run: bool) -> None:
-    """Write the daily report to 日报/<date>.提炼报告.md."""
-    date = report["date"]
-    report_dir = vault / "日报"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f"{date}.提炼报告.md"
+def update_libraries(cfg, results, dry_run=False):
+    """Update error library and habit library from extracted markers."""
+    # ── Error library ──
+    err_entries = results.get("ERROR", [])
+    if err_entries and not dry_run:
+        err_file = cfg["errors_file"]
+        if err_file.exists():
+            content = err_file.read_text("utf-8")
+            lines = content.split("\n")
 
-    md = generate_report_md(report)
-    if dry_run:
-        print(f"[DRY-RUN] Would write to: {report_path}")
-        print(md)
-    else:
-        report_path.write_text(md, "utf-8")
-        print(f"[daily_refinement] Report written: {report_path}")
+            for entry in err_entries:
+                err_type = (entry["groups"][0] or "").strip().lower()
+                resolution = (entry["groups"][1] or "").strip()
+                if not err_type:
+                    continue
+
+                matched_idx = -1
+                for i, ln in enumerate(lines):
+                    if ln.startswith("## ") and err_type in ln.lower():
+                        matched_idx = i
+                        break
+
+                if matched_idx >= 0:
+                    for j in range(matched_idx, min(matched_idx + 10, len(lines))):
+                        if "- **次数：**" in lines[j]:
+                            m2 = re.search(r'\d+', lines[j])
+                            if m2:
+                                old_n = int(m2.group())
+                                lines[j] = lines[j].replace(str(old_n), str(old_n + 1), 1)
+                            break
+                    # Update resolution if present and not "待补充"
+                    if resolution:
+                        for j in range(matched_idx, min(matched_idx + 10, len(lines))):
+                            if "- **解决：**" in lines[j] and "待补充" in lines[j]:
+                                lines[j] = f"- **解决：** {resolution}"
+                                break
+                else:
+                    new_num = len([l for l in lines if l.startswith("## #")]) + 1
+                    template = (
+                        f"\n## #{new_num} {err_type.capitalize()}\n"
+                        f"- **次数：** 1\n"
+                    )
+                    if resolution:
+                        template += f"- **解决：** {resolution}\n"
+                    else:
+                        template += "- **解决：** (待补充)\n"
+                    template += "- **领域：** 通用\n"
+                    content += template
+                    lines = content.split("\n")
+
+            content = "\n".join(lines)
+            err_file.write_text(content, "utf-8")
+            print(f"[daily] Error library: {len(err_entries)} marker(s) processed")
+
+    # ── Trigger patterns → habit library ──
+    trigger_entries = results.get("TRIGGER", [])
+    if trigger_entries and not dry_run:
+        habits_file = cfg["habits_file"]
+        if habits_file.exists():
+            content = habits_file.read_text("utf-8")
+            lines = content.split("\n")
+
+            for entry in trigger_entries:
+                summary = (entry["groups"][0] or "").strip()
+                action = (entry["groups"][1] or "").strip()
+                if not summary:
+                    continue
+                keyword = summary[:30]
+
+                matched = False
+                for i, ln in enumerate(lines):
+                    if ln.startswith("## [") and keyword.lower() in ln.lower():
+                        matched = True
+                        for j in range(i, min(i + 10, len(lines))):
+                            if "- **次数：**" in lines[j]:
+                                m2 = re.search(r'\d+', lines[j])
+                                if m2:
+                                    old_n = int(m2.group())
+                                    lines[j] = lines[j].replace(str(old_n), str(old_n + 1), 1)
+                                break
+                        break
+
+                if not matched:
+                    new_entry = (
+                        f"\n## [通用] {keyword}\n"
+                        f"- **次数：** 1\n"
+                        f"- **场景：** {keyword}\n"
+                        f"- **模板：** (待提炼)\n"
+                        f"- **阈值：** 50\n"
+                        f"- **来源：** 日报自动记录\n"
+                    )
+                    content += new_entry
+
+            content = "\n".join(lines)
+            habits_file.write_text(content, "utf-8")
+            print(f"[daily] Habit library: {len(trigger_entries)} trigger(s) processed")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Daily refinement — scan topic files and update memory."
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview only, do not modify any files.",
-    )
-    parser.add_argument(
-        "--date",
-        type=str,
-        default=None,
-        help="Target date YYYY-MM-DD (default: yesterday).",
-    )
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--date", default=None)
     args = parser.parse_args()
 
     cfg = load_config()
-    vault = _resolve_vault(cfg)
+    ref_date = args.date or (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
-    print(f"[daily_refinement] Vault: {vault}")
-    print(f"[daily_refinement] Dry-run: {args.dry_run}")
-    print(f"[daily_refinement] Target date: {args.date or yesterday_str()}")
+    results = scan_topics(cfg, ref_date)
+    total = sum(len(v) for v in results.values())
 
-    report = process_vault(cfg, dry_run=args.dry_run)
-    write_report(report, vault, dry_run=args.dry_run)
+    print(f"[daily] {ref_date}: {total} markers in topic files")
+    for k, v in results.items():
+        print(f"  {k}: {len(v)}")
 
-    if report["audit_records"]:
-        print(f"[daily_refinement] Processed {len(report['audit_records'])} markers.")
-    if report["pending"]:
-        print(f"[daily_refinement] {len(report['pending'])} items pending review.")
-    if report["errors"]:
-        for e in report["errors"]:
-            print(f"[daily_refinement] WARNING: {e}", file=sys.stderr)
+    if not args.dry_run and total > 0:
+        report = generate_report(cfg, ref_date, results)
+        print(f"[daily] Report: {report}")
+
+    update_libraries(cfg, results, args.dry_run)
+
+    # Auto-archive stale error entries (60d no trigger → archived)
+    if not args.dry_run:
+        archive_stale(cfg, ref_date)
+
+
+def archive_stale(cfg, today):
+    """Mark error entries with last_seen > 60 days as '已归档'."""
+    err_file = cfg["errors_file"]
+    if not err_file.exists():
+        return
+    content = err_file.read_text("utf-8")
+    lines = content.split("\n")
+    modified = False
+    now_date = datetime.date.fromisoformat(today) if today else datetime.date.today()
+
+    for i, ln in enumerate(lines):
+        if ln.startswith("## #"):
+            # Check for last_seen field in following lines
+            name = ln.strip()
+            last_seen_date = None
+            last_seen_idx = -1
+            status_idx = -1
+            for j in range(i, min(i + 15, len(lines))):
+                if "- **最近出现：**" in lines[j]:
+                    date_str = lines[j].split("最近出现：**")[-1].strip()
+                    try:
+                        last_seen_date = datetime.date.fromisoformat(date_str[:10])
+                        last_seen_idx = j
+                    except (ValueError, IndexError):
+                        pass
+                if "- **状态：**" in lines[j]:
+                    status_idx = j
+                if ln.strip() == "---" and j > i:
+                    break  # end of entry
+
+            if last_seen_date:
+                days_since = (now_date - last_seen_date).days
+                if days_since > 60:
+                    if status_idx >= 0 and "已归档" not in lines[status_idx]:
+                        lines[status_idx] = "- **状态：** 已归档"
+                        modified = True
+                        print(f"[daily] Archive: {name} ({days_since}d since last seen)")
+            else:
+                # No last_seen field — add one (use today as starting point)
+                insert_at = i + 1
+                # Find where frequency line ends
+                for j in range(i, min(i + 10, len(lines))):
+                    if "- **次数：**" in lines[j]:
+                        lines[j] = lines[j] + f"\n- **最近出现：** {today}"
+                        modified = True
+                        break
+                else:
+                    # No count line, insert after name
+                    lines.insert(insert_at, f"- **最近出现：** {today}")
+                    modified = True
+
+    if modified:
+        err_file.write_text("\n".join(lines), "utf-8")
 
 
 if __name__ == "__main__":
     main()
-
