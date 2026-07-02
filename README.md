@@ -93,39 +93,81 @@ second-brain-kit/
 ├── src/
 │   ├── config.py            # 配置加载器
 │   ├── obsidian_writer.py   # 写入 Markdown 到 vault（TCP :49520）
-│   ├── supervisor.py        # 规则检测拦截器（TCP :49522）
-│   └── hook_logger.py       # stdin 转发 + JSONL 降级
+│   ├── hook_logger.py       # stdin 转发 + JSONL 降级（神经）
+│   ├── daily_refinement.py  # v2: 结构化日志提炼 + 自动归档
+│   ├── knowledge_indexer.py # v2: 知识库索引生成 + 检索
+│   ├── ingest.py            # 知识库导入工具
+│   ├── dedup.py             # 知识库去重工具
+│   ├── weekly_check.py      # 周自检脚本
+│   └── supervisor-go/       # 小脑：Go 版监督程序
+│       ├── main.go          # 上下文注入 + 规则检查 + 知识检索
+│       ├── writer.go        # Vault 写入器
+│       ├── errorlib.go      # 错误库加载器
+│       ├── habit.go         # 习惯库加载器
+│       └── go.mod           # Go module
 ├── vault-template/          # Obsidian vault 种子内容
-│   ├── 记忆/                 # 记忆文件（规则 + 高频错误）
-│   │   ├── 全局/             # 全局领域
-│   │   ├── 编程/             # 编程领域
-│   │   └── 写作/             # 写作领域
-│   ├── 知识库/               # 知识库（含交叉链接示例）
-│   ├── 待办清单.md           # 示例待办
-│   ├── 项目/                 # 项目笔记（预留）
-│   ├── 话题/                 # 话题文件（守护进程自动写入）
-│   ├── 日报/                 # 日报（预留）
-│   └── 流程库/               # 流程库（预留）
 ├── docs/                    # 文档
-├── setup.bat                # Windows 安装脚本
-├── setup.sh                 # macOS / Linux 安装脚本
+├── setup.bat / setup.sh     # 安装脚本
 └── LICENSE                  # MIT
 ```
 
 ## 工作原理
 
 ```
-AI Agent  ──stdin──>  hook_logger.py  ──TCP──>  obsidian_writer.py  ──>  Obsidian Vault
+AI Agent  ──stdin──>  hook_logger.py(神经) ──TCP──>  obsidian_writer.py ──>  Obsidian Vault(大脑)
                             │
-                            └──TCP──>  supervisor.py  ──>  "规则.md" / "高频错误.md"
+                            └──TCP──>  supervisor.exe(小脑) ──>  监督规则 + 上下文注入 + 知识检索
                                            │
-                                           └── 违规消息 ──stdout──> AI Agent（下回合）
+                                           └── systemMessage ──stdout──> AI Agent（下回合）
 ```
 
-1. AI agent 将 JSON 事件输出到 `stdout`（通过管道传入 `hook_logger.py`）。
-2. `hook_logger.py` 将所有事件转发给 `obsidian_writer.py`，后者将其追加写入 vault 中的 Markdown 文件。
-3. 对于 `PreToolUse` 事件，`hook_logger.py` 还会询问 `supervisor.py`，检查即将执行的操作是否违反记忆规则。
-4. 如果检测到违规，`supervisor` 返回一条 `systemMessage`——AI 的运行环境会将它注入下一轮 LLM 调用。
+**v2.0 三层架构：大脑(Vault) / 小脑(supervisor) / 神经(hook_logger)**
+
+1. **神经 (hook_logger.py)** — 纯传输层，只做事件转发和日志降级，不做决策。
+2. **小脑 (supervisor.exe, Go)** — 智能决策层。SessionStart 自动注入上下文包（规则+错误+习惯+进度），UserPrompt 检索相关知识，PreToolUse 检查监督规则。
+3. **大脑 (Obsidian Vault)** — 所有知识的持久存储。Agent 按需读取，系统自动推送。
+
+---
+
+## v2.0 新增功能 / What's New
+
+### Agent 激活模式（实验性）
+
+v2.0 支持"激活性记忆"模式：Agent 启动时只加载一份紧凑的 `AGENTS.md`（~1.5KB），包含 Vault 地图 + 系统能力概述。所有具体知识（规则、错误、习惯、经验）存放在 Obsidian Vault 中，Agent 按需读取或由小脑在 SessionStart 自动推送。
+
+**与全部记忆加载的区别：**
+
+| | 全部记忆 | 激活性记忆 |
+|---|---|---|
+| 加载量 | 33个文件，数千 tokens | 1个文件，~200 tokens |
+| 知识更新 | 重启 Reasonix 生效 | 改 Vault 即时生效 |
+| 维护 | 需手动同步 Vault ↔ memory | Vault 是唯一真相来源 |
+| 风险 | 文件多，容易不一致 | 依赖 Vault 可达性 |
+
+**⚠️ 注意：此模式为实验性功能，默认关闭。** 要启用，需用户手动：
+1. 备份现有记忆：`python memory_restore.py`
+2. 清空 `~/.reasonix/memory/global/`
+3. 确保 `AGENTS.md` 在项目根目录
+
+**Plan B（恢复方法）：** 如果激活模式出问题（Agent 找不到数据），运行：
+```
+python memory_restore.py
+```
+所有旧记忆瞬间恢复，重启 Reasonix 即可回到普通模式。
+
+### 结构化日志格式 v2
+
+话题文件采用新标注格式，支持 MECE 分类和自动提炼：
+```
+[DECISION: 决策摘要 | context: 背景 | scope: 范围]
+[ERROR: 错误类型 | resolution: 方案 | tool: 工具 | fixed: true/false]
+[PREFERENCE: 偏好 | source: user|ai]
+[PENDING: 待办 | context: 背景]
+```
+
+### 知识索引
+
+`knowledge_indexer.py` 扫描 `知识库/` 生成 `~/.reasonix/knowledge_index.json`，支持按关键词检索 Top-N 条目，SessionStart 和 UserPrompt 时自动注入相关记忆。
 
 ---
 
