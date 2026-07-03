@@ -1,4 +1,4 @@
-# Second Brain Kit / 外置大脑
+﻿# Second Brain Kit / 外置大脑
 
 <div align="center">
 
@@ -80,7 +80,7 @@ bash setup.sh
 1. **启动守护进程：**
    ```bash
    python src/obsidian_writer.py   # 监听 TCP :49520
-   python src/supervisor.py        # 监听 TCP :49522
+   go build -o supervisor.exe src/supervisor-go/ && supervisor.exe      # 监听 TCP :49522
    ```
 2. **配置你的 AI agent** 将 hook 事件发送给守护进程（详见 `docs/` 中的协议文档）。
 3. **打开你的 Obsidian vault**——新笔记会自动出现在 `话题/` 和 `reasonix-raw/` 中。
@@ -239,7 +239,7 @@ The setup script will ask for your Obsidian vault path, copy the vault template,
 1. **Start the daemons:**
    ```bash
    python src/obsidian_writer.py   # listens on TCP :49520
-   python src/supervisor.py        # listens on TCP :49522
+   go build -o supervisor.exe src/supervisor-go/ && supervisor.exe      # listens on TCP :49522
    ```
 2. **Configure your AI agent** to send hook events to the daemons (see the protocol documentation in `docs/`).
 3. **Open your Obsidian vault** — new notes appear automatically in `reasonix-raw/` (by date) and `话题/` (by topic).
@@ -529,3 +529,4 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 *Built for AI agents, by AI agents.*
+
