@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ var (
 	qqLogPath      string
 	wxLogPath      string
 	stateFile      string
-	ownLogFile     string // supervisor 自身运行日志
+	ownLogFile     string
 )
 
 func initPaths() {
@@ -36,7 +37,6 @@ func initPaths() {
 	ownLogFile = filepath.Join(os.Getenv("USERPROFILE"), ".reasonix", "logs", "supervisor_run.log")
 }
 
-// ── 自身日志 ──
 var logMu sync.Mutex
 
 func writeLog(format string, args ...any) {
@@ -50,7 +50,376 @@ func writeLog(format string, args ...any) {
 	}
 }
 
-// ── Rules ──
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1️⃣ 置信度 + 分级规则
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type Confidence int
+
+const (
+	ConfSilent Confidence = iota // <40%, silently ignore
+	ConfLow                     // 40-65%, log only, no warning
+	ConfMedium                  // 65-85%, mild warning
+	ConfHigh                    // >85%, active warning + systemMessage
+)
+
+// supervisorRuleConfig is loaded from 记忆/监督规则.md
+type SupervisorRuleConfig struct {
+	Enabled    bool
+	Confidence Confidence
+	Threshold  int  // for loop-detection
+}
+
+var supervisorRules = map[string]*SupervisorRuleConfig{}
+var srMu sync.RWMutex
+
+func loadSupervisorRules(vaultPath string) {
+	path := filepath.Join(vaultPath, "记忆", "监督规则.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		writeLog("supervisor rules: %v", err)
+		return
+	}
+	newRules := map[string]*SupervisorRuleConfig{}
+	currentID := ""
+	var currentCfg *SupervisorRuleConfig
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## ") && !strings.HasPrefix(line, "## #") {
+			if currentID != "" && currentCfg != nil {
+				newRules[currentID] = currentCfg
+			}
+			currentID = strings.TrimPrefix(line, "## ")
+			currentCfg = &SupervisorRuleConfig{Enabled: true, Confidence: ConfMedium, Threshold: 3}
+			continue
+		}
+		if currentCfg == nil {
+			continue
+		}
+		if strings.Contains(line, "启用:") {
+			currentCfg.Enabled = !strings.Contains(line, "false")
+		} else if strings.Contains(line, "置信度:") {
+			switch {
+			case strings.Contains(strings.ToLower(line), "high"):
+				currentCfg.Confidence = ConfHigh
+			case strings.Contains(strings.ToLower(line), "medium"):
+				currentCfg.Confidence = ConfMedium
+			case strings.Contains(strings.ToLower(line), "low"):
+				currentCfg.Confidence = ConfLow
+			case strings.Contains(strings.ToLower(line), "silent") || strings.Contains(strings.ToLower(line), "off"):
+				currentCfg.Confidence = ConfSilent
+			}
+		} else if strings.Contains(line, "阈值:") {
+			parts := strings.Split(line, "阈值:")
+			if len(parts) > 1 {
+				if n, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && n > 0 {
+					currentCfg.Threshold = n
+				}
+			}
+		}
+	}
+	if currentID != "" && currentCfg != nil {
+		newRules[currentID] = currentCfg
+	}
+	srMu.Lock()
+	supervisorRules = newRules
+	srMu.Unlock()
+	writeLog("supervisor rules: loaded %d configs", len(newRules))
+}
+
+func getRuleConfig(ruleID string) *SupervisorRuleConfig {
+	srMu.RLock()
+	defer srMu.RUnlock()
+	return supervisorRules[ruleID]
+}
+
+type RuleDef struct {
+	ID         string
+	Category   string // "shell" | "filesystem" | "sequence" | "error"
+	Detect func(toolName string, args map[string]any) (matched bool, detail string)
+	Confidence Confidence
+	Solution   string
+}
+
+var builtinRules = []RuleDef{
+	{
+		ID: "backup-before-overwrite", Category: "filesystem",
+		Confidence: ConfHigh,
+		Solution:   "Backup config files before overwriting",
+		Detect: func(tn string, args map[string]any) (bool, string) {
+			if strings.ToLower(tn) != "write_file" {
+				return false, ""
+			}
+			p, ok := args["path"].(string)
+			if !ok {
+				return false, ""
+			}
+			ext := strings.ToLower(filepath.Ext(p))
+			if ext == ".toml" || ext == ".json" || ext == ".yaml" || ext == ".yml" {
+				return true, fmt.Sprintf("Writing %s without backup", filepath.Base(p))
+			}
+			return false, ""
+		},
+	},
+	{
+		ID: "gbk-encoding", Category: "shell",
+		Confidence: ConfMedium,
+		Solution:   "Set encoding=utf-8 or pass Chinese strings via env var",
+		Detect: func(tn string, args map[string]any) (bool, string) {
+			tl := strings.ToLower(tn)
+			if tl != "bash" && tl != "echo" && tl != "powershell" && tl != "cmd" {
+				return false, ""
+			}
+			for _, v := range args {
+				if s, ok := v.(string); ok && hasChinese(s) && !isVaultPath(s) {
+					return true, "Command contains CJK characters"
+				}
+			}
+			return false, ""
+		},
+	},
+	{
+		ID: "chinese-path", Category: "filesystem",
+		Confidence: ConfLow,
+		Solution:   "Use ASCII paths or verify file encoding",
+		Detect: func(tn string, args map[string]any) (bool, string) {
+			tl := strings.ToLower(tn)
+			if tl != "read_file" && tl != "write_file" && tl != "edit_file" && tl != "glob" && tl != "grep" {
+				return false, ""
+			}
+			p, ok := args["path"].(string)
+			if ok && hasChinese(p) && !isVaultPath(p) {
+				return true, fmt.Sprintf("CJK path: %s", filepath.Base(p))
+			}
+			return false, ""
+		},
+	},
+	{
+		ID: "loop-detection", Category: "sequence",
+		Confidence: ConfHigh,
+		Solution:   "Change approach or check preconditions first",
+		Detect: func(tn string, args map[string]any) (bool, string) {
+			if checkLoop(tn) {
+				thresh := 3
+			if cfg2 := getRuleConfig("loop-detection"); cfg2 != nil {
+				thresh = cfg2.Threshold
+			}
+			return true, fmt.Sprintf("%s called %d+ times consecutively", tn, thresh)
+			}
+			return false, ""
+		},
+	},
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2️⃣ 动态白名单（10 分钟滑动窗口）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type rateEntry struct {
+	count     int
+	firstSeen time.Time
+}
+
+var (
+	rateLimiters = make(map[string]*rateEntry)
+	rateMu       sync.Mutex
+)
+
+func checkRateLimit(ruleID string) int {
+	rateMu.Lock()
+	defer rateMu.Unlock()
+
+	now := time.Now()
+	e, ok := rateLimiters[ruleID]
+	if !ok {
+		rateLimiters[ruleID] = &rateEntry{count: 1, firstSeen: now}
+		return 1
+	}
+	// Reset if outside 10-min window
+	if now.Sub(e.firstSeen) > 10*time.Minute {
+		e.count = 1
+		e.firstSeen = now
+		return 1
+	}
+	e.count++
+	return e.count
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3️⃣ 延迟裁决队列（等待 1-2 步看 AI 是否自纠正）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type pendingJudgment struct {
+	RuleID     string
+	ToolName   string
+	Detail     string
+	Solution   string
+	Confidence Confidence
+	CreatedAt  time.Time
+	PrevTool   string
+}
+
+var (
+	pendingQueue   []*pendingJudgment
+	pendingMu      sync.Mutex
+)
+
+func enqueueDelayed(v *pendingJudgment) {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	pendingQueue = append(pendingQueue, v)
+}
+
+func checkDelayedCorrection(toolName string, args map[string]any) *pendingJudgment {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+
+	if len(pendingQueue) == 0 {
+		return nil
+	}
+
+	tl := strings.ToLower(toolName)
+	now := time.Now()
+	var resolved []int
+
+	for i, pj := range pendingQueue {
+		if now.Sub(pj.CreatedAt) > 30*time.Second {
+			resolved = append(resolved, i)
+			continue
+		}
+		// Check if AI self-corrected (added try/except, checked preconditions, etc.)
+		if isSelfCorrectingAction(tl, args) {
+			writeLog("delayed: self-correct detected for %s, cancelling warning", pj.RuleID)
+			resolved = append(resolved, i)
+			continue
+		}
+		// If AI moved on to a different tool, issue the pending warning
+		if tl != strings.ToLower(pj.ToolName) && tl != pj.PrevTool {
+			result := pj
+			// Remove from queue
+			resolved = append(resolved, i)
+			return result
+		}
+	}
+
+	// Remove resolved entries
+	if len(resolved) > 0 {
+		var kept []*pendingJudgment
+		for i, pj := range pendingQueue {
+			skip := false
+			for _, ri := range resolved {
+				if i == ri {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				kept = append(kept, pj)
+			}
+		}
+		pendingQueue = kept
+	}
+
+	return nil
+}
+
+func isSelfCorrectingAction(toolName string, args map[string]any) bool {
+	tl := strings.ToLower(toolName)
+	// Check for try-except, defer, backup, encoding specifiers
+	for _, v := range args {
+		if s, ok := v.(string); ok {
+			sl := strings.ToLower(s)
+			if strings.Contains(sl, "try") || strings.Contains(sl, "except") ||
+				strings.Contains(sl, "defer") || strings.Contains(sl, "encoding=utf-8") ||
+				strings.Contains(sl, "encoding='utf-8'") || strings.Contains(sl, ".bak") ||
+				strings.Contains(sl, "backup") {
+				return true
+			}
+		}
+	}
+	// Check if it's a "check preconditions" tool
+	if tl == "read_file" || tl == "stat" || tl == "exists" || tl == "ls" || tl == "glob" {
+		return true
+	}
+	return false
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 4️⃣ 反馈解析 — 从 AI 回复中提取误报标注
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var feedbackPattern = regexp.MustCompile(`<!--\s*audit_feedback:\s*(false_positive|true_positive|ignore)\s*(?::\s*(.+?))?\s*-->`)
+
+func parseFeedback(text string) (kind, ruleHint string) {
+	m := feedbackPattern.FindStringSubmatch(text)
+	if len(m) > 1 {
+		kind = m[1]
+		if len(m) > 2 {
+			ruleHint = strings.TrimSpace(m[2])
+		}
+	}
+	return
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tools
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func isVaultPath(s string) bool {
+	abs, _ := filepath.Abs(s)
+	return strings.Contains(abs, vaultPath) || strings.Contains(abs, "个人数据\\辞玖")
+}
+
+func hasChinese(s string) bool {
+	for _, r := range s {
+		if r >= 0x4e00 && r <= 0x9fff {
+			return true
+		}
+	}
+	return false
+}
+
+type toolTracker struct {
+	count    int
+	lastSeen time.Time
+}
+
+var (
+	toolTrackers = make(map[string]*toolTracker)
+	loopMu       sync.Mutex
+)
+
+func checkLoop(toolName string) bool {
+	// Get configurable threshold from vault (default 3)
+	threshold := 3
+	if cfg := getRuleConfig("loop-detection"); cfg != nil {
+		threshold = cfg.Threshold
+	}
+
+	loopMu.Lock()
+	defer loopMu.Unlock()
+	t, ok := toolTrackers[toolName]
+	if !ok {
+		toolTrackers[toolName] = &toolTracker{count: 1, lastSeen: time.Now()}
+		return false
+	}
+	if time.Since(t.lastSeen) > 5*time.Minute {
+		t.count = 1
+		t.lastSeen = time.Now()
+		return false
+	}
+	t.count++
+	t.lastSeen = time.Now()
+	if t.count >= threshold {
+		t.count = 0
+		return true
+	}
+	return false
+}
+
+// ── Rules loading ──
+
 type Rule struct {
 	Domain  string
 	Keyword string
@@ -66,15 +435,14 @@ type ErrorPattern struct {
 var (
 	rules         []Rule
 	errorPatterns []ErrorPattern
-	mu            sync.RWMutex
+	ruleMu        sync.RWMutex
 )
 
 func loadRules() {
-	mu.Lock()
-	defer mu.Unlock()
+	ruleMu.Lock()
+	defer ruleMu.Unlock()
 	rules = nil
 	errorPatterns = nil
-
 	entries, err := os.ReadDir(memoryDir)
 	if err != nil {
 		writeLog("cannot read memory dir: %v", err)
@@ -88,7 +456,7 @@ func loadRules() {
 		loadRuleFile(filepath.Join(memoryDir, domain, "规则.md"), domain)
 		loadErrorFile(filepath.Join(memoryDir, domain, "高频错误.md"), domain)
 	}
-	writeLog("loaded %d rules, %d error patterns", len(rules), len(errorPatterns))
+	writeLog("loaded %d rules, %d error patterns from memory", len(rules), len(errorPatterns))
 }
 
 func loadRuleFile(path, domain string) {
@@ -120,11 +488,18 @@ func loadErrorFile(path, domain string) {
 		}
 		if current != nil {
 			if strings.Contains(line, "**现象：") {
-				kw := extractContent(line, "现象：")
-				current.Keywords = append(current.Keywords, strings.Fields(kw)...)
+				start := strings.Index(line, "**现象：")
+				end := strings.Index(line[start+5:], "**")
+				if end > 0 {
+					current.Keywords = append(current.Keywords, strings.Fields(line[start+5:start+5+end])...)
+				}
 			}
 			if strings.Contains(line, "**解决：") {
-				current.Solution = extractContent(line, "解决：")
+				start := strings.Index(line, "**解决：")
+				end := strings.Index(line[start+5:], "**")
+				if end > 0 {
+					current.Solution = line[start+5 : start+5+end]
+				}
 			}
 		}
 	}
@@ -133,53 +508,500 @@ func loadErrorFile(path, domain string) {
 	}
 }
 
-func extractContent(line, prefix string) string {
-	start := strings.Index(line, prefix)
-	if start < 0 {
-		return ""
+// ── PostToolUse error matching ──
+func matchPostToolError(toolName, toolResult string) *violation {
+	if toolResult == "" {
+		return nil
 	}
-	start += len(prefix)
-	end := strings.Index(line[start:], "**")
-	if end < 0 {
-		return strings.TrimSpace(line[start:])
+	lower := strings.ToLower(toolResult)
+	ruleMu.RLock()
+	defer ruleMu.RUnlock()
+
+	for _, ep := range errorPatterns {
+		for _, kw := range ep.Keywords {
+			if kw == "" {
+				continue
+			}
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				count := checkRateLimit("error:" + ep.Name)
+				return &violation{
+					Violated: true,
+					Rule:     ep.Domain + " · " + ep.Name,
+					Detail:   fmt.Sprintf("匹配到高频错误（已出现 %d 次）", count),
+					Solution: ep.Solution,
+					Evidence: fmt.Sprintf("tool=%s keyword=%q", toolName, kw),
+				}
+			}
+		}
 	}
-	return strings.TrimSpace(line[start : start+end])
+	return nil
 }
 
-// ── Loop Detection ──
-type toolTracker struct {
-	count    int
-	lastSeen time.Time
+// ── Violation types ──
+
+type violation struct {
+	Violated      bool   `json:"violated"`
+	Rule          string `json:"rule,omitempty"`
+	Detail        string `json:"detail,omitempty"`
+	Solution      string `json:"solution,omitempty"`
+	Evidence      string `json:"evidence,omitempty"`
+	SystemMessage string `json:"systemMessage,omitempty"`
 }
 
-var (
-	toolTrackers = make(map[string]*toolTracker)
-	loopMu       sync.Mutex
-)
+// ═══════════════════════════════════════════════════════════════════════════════
+// TCP Handler — 统一处理 PreToolUse + PostToolUse
+// ═══════════════════════════════════════════════════════════════════════════════
 
-func checkLoop(toolName string) bool {
-	loopMu.Lock()
-	defer loopMu.Unlock()
-	t, ok := toolTrackers[toolName]
-	if !ok {
-		toolTrackers[toolName] = &toolTracker{count: 1, lastSeen: time.Now()}
-		return false
+type toolEvent struct {
+	Event      string         `json:"event"`
+	ToolName   string         `json:"toolName"`
+	ToolArgs   map[string]any `json:"toolArgs"`
+	ToolResult string         `json:"toolResult,omitempty"`
+	Content    string         `json:"content,omitempty"`
+	Prompt     string         `json:"prompt,omitempty"`
+}
+
+func handleSupervisorConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	data := make([]byte, 65536)
+	n, err := conn.Read(data)
+	if err != nil {
+		return
 	}
-	if time.Since(t.lastSeen) > 5*time.Minute {
-		t.count = 1
-		t.lastSeen = time.Now()
-		return false
+	var evt toolEvent
+	if err := json.Unmarshal(data[:n], &evt); err != nil {
+		return
 	}
-	t.count++
-	t.lastSeen = time.Now()
-	if t.count >= 3 {
-		t.count = 0
-		return true
+
+	// Check for feedback markers in any text field
+	for _, txt := range []string{evt.Content, evt.ToolResult} {
+		kind, hint := parseFeedback(txt)
+		if kind != "" {
+			writeLog("feedback: %s (hint=%s)", kind, hint)
+		}
 	}
-	return false
+
+	switch evt.Event {
+	case "SessionStart":
+		handleSessionStart(conn)
+	case "PreToolUse":
+		handlePreToolUse(evt.ToolName, evt.ToolArgs, conn)
+	case "PostToolUse":
+		handlePostToolUse(evt.ToolName, evt.ToolResult, conn)
+	case "UserPromptSubmit":
+		handleUserPrompt(evt.Prompt, conn)
+	case "Shutdown":
+		conn.Write([]byte(`{"shutdown":true}`))
+		writeLog("shutdown requested via TCP, exiting")
+		os.Exit(0)
+	default:
+		conn.Write([]byte(`{"violated":false}`))
+	}
+}
+
+func handlePreToolUse(toolName string, args map[string]any, conn net.Conn) {
+	// Check habit library first
+	habit, habitScore := matchHabit(toolName, args)
+	if habit != nil && habitScore >= habit.Threshold {
+		resp, _ := json.Marshal(&violation{
+			Violated: false,
+			Rule:     habit.Title,
+			Detail:   fmt.Sprintf("match %d%%", habitScore),
+			Solution: habit.Template,
+			SystemMessage: fmt.Sprintf("Habit:%s\n%s (match %d%%)", habit.Title, habit.Template, habitScore),
+		})
+		conn.Write(resp)
+		incrementHabitCount(habit.ID)
+		return
+	}
+	if habit != nil && habitScore >= 50 {
+		cnt := checkHabitCounter(habit.ID)
+		if cnt >= 3 {
+			resp, _ := json.Marshal(&violation{
+				Violated: false,
+				Rule:     habit.Title,
+				Detail:   fmt.Sprintf("habit scene %d times", cnt),
+				Solution: habit.Template,
+				SystemMessage: fmt.Sprintf("Habit:%s\n%s (accumulated %dx)", habit.Title, habit.Template, cnt),
+			})
+			conn.Write(resp)
+			incrementHabitCount(habit.ID)
+			return
+		}
+	}
+
+	// First check delayed queue — see if a prior warning is now due
+	if pj := checkDelayedCorrection(toolName, args); pj != nil {
+		resp, _ := json.Marshal(&violation{
+			Violated: true,
+			Rule:     pj.RuleID,
+			Detail:   pj.Detail,
+			Solution: pj.Solution,
+			SystemMessage: fmt.Sprintf("⚠️ 前一步 %s 可能有问题: %s — %s", pj.ToolName, pj.Detail, pj.Solution),
+		})
+		conn.Write(resp)
+		logViolation(pj.ToolName, resp)
+		return
+	}
+
+	// Check built-in rules against vault config
+	for _, rule := range builtinRules {
+		matched, detail := rule.Detect(toolName, args)
+		if !matched {
+			continue
+		}
+
+		// Check vault config: disabled? silent?
+		cfg := getRuleConfig(rule.ID)
+		if cfg != nil {
+			if !cfg.Enabled {
+				continue // rule disabled in vault
+			}
+		}
+
+		// Effective confidence: vault override or rule default
+		effectiveConf := rule.Confidence
+		if cfg != nil {
+			effectiveConf = cfg.Confidence
+		}
+
+		// If effective confidence is Silent, log only
+		if effectiveConf == ConfSilent {
+			writeLog("silent: %s matched %s — suppressed", rule.ID, toolName)
+			continue
+		}
+
+		count := checkRateLimit(rule.ID)
+		if count > 3 {
+			writeLog("ratelimit: %s fired %d times in 10min, downgrading", rule.ID, count)
+			if effectiveConf > ConfLow {
+				effectiveConf--
+			}
+		}
+
+		switch effectiveConf {
+		case ConfHigh:
+			resp, _ := json.Marshal(&violation{
+				Violated: true,
+				Rule:     rule.ID,
+				Detail:   detail,
+				Solution: rule.Solution,
+				SystemMessage: fmt.Sprintf("⚠️ %s — %s（建议：%s）", rule.ID, detail, rule.Solution),
+			})
+			conn.Write(resp)
+			logViolation(toolName, resp)
+			return
+
+		case ConfMedium:
+			resp, _ := json.Marshal(&violation{
+				Violated: true,
+				Rule:     rule.ID,
+				Detail:   detail,
+				Solution: rule.Solution,
+				SystemMessage: fmt.Sprintf("⚠️ 检测到 %s — %s，请向用户二次确认是否继续", rule.ID, detail),
+			})
+			conn.Write(resp)
+			logViolation(toolName, resp)
+			return
+
+		case ConfLow:
+			// Don't alert yet — enqueue for delayed judgment
+			enqueueDelayed(&pendingJudgment{
+				RuleID:     rule.ID,
+				ToolName:   toolName,
+				Detail:     detail,
+				Solution:   rule.Solution,
+				Confidence: ConfLow,
+				CreatedAt:  time.Now(),
+			})
+			writeLog("delayed: enqueued %s for %s", rule.ID, toolName)
+			conn.Write([]byte(`{"violated":false,"note":"pending_review"}`))
+			return
+		default:
+			writeLog("unknown confidence: %s level=%d", rule.ID, effectiveConf)
+		}
+	}
+
+	conn.Write([]byte(`{"violated":false}`))
+}
+
+func handlePostToolUse(toolName, toolResult string, conn net.Conn) {
+	// Match actual errors against error patterns
+	v := matchPostToolError(toolName, toolResult)
+	if v != nil {
+		resp, _ := json.Marshal(v)
+		conn.Write(resp)
+		logViolation(toolName, resp)
+		return
+	}
+	// Check if tool succeeded — this means a prior delayed warning might be over-cautious
+	pendingMu.Lock()
+	var kept []*pendingJudgment
+	for _, pj := range pendingQueue {
+		if strings.ToLower(pj.ToolName) == strings.ToLower(toolName) && toolResult != "" && !isErrorResult(toolResult) {
+			writeLog("delayed: %s succeeded, cancelling pending warning", pj.RuleID)
+			continue // drop this pending item
+		}
+		kept = append(kept, pj)
+	}
+	pendingQueue = kept
+	pendingMu.Unlock()
+
+	conn.Write([]byte(`{"violated":false}`))
+}
+
+// ── SessionStart: context injection ──
+
+func handleSessionStart(conn net.Conn) {
+	ctx := buildContextPackage()
+	if ctx != "" {
+		msg := fmt.Sprintf("## 小脑已激活\n\n%s", ctx)
+		resp, _ := json.Marshal(&violation{Violated: false, SystemMessage: msg})
+		conn.Write(resp)
+		writeLog("session-start: context injected (%d chars)", len(msg))
+	} else {
+		conn.Write([]byte(`{"violated":false}`))
+	}
+}
+
+func handleUserPrompt(prompt string, conn net.Conn) {
+	if len(prompt) < 3 {
+		conn.Write([]byte(`{"violated":false}`))
+		return
+	}
+	results := searchKnowledge(prompt, 3)
+	if len(results) == 0 {
+		conn.Write([]byte(`{"violated":false}`))
+		return
+	}
+	var lines []string
+	lines = append(lines, "## 相关知识")
+	for _, r := range results {
+		lines = append(lines, fmt.Sprintf("- %s: %s", r.Title, r.Summary[:min(80, len(r.Summary))]))
+	}
+	msg := strings.Join(lines, "\n")
+	resp, _ := json.Marshal(&violation{Violated: false, SystemMessage: msg})
+	conn.Write(resp)
+	writeLog("user-prompt: knowledge injected for %q (%d results)", prompt[:min(40,len(prompt))], len(results))
+}
+
+func min(a, b int) int {
+	if a < b { return a }
+	return b
+}
+
+// ── Context package builder (mirrors hook_logger's get_session_context) ──
+
+func buildContextPackage() string {
+	var b strings.Builder
+
+	// 1. System capabilities
+	b.WriteString("## 🧠 系统能力\n")
+	b.WriteString("- 监督规则: 高风险操作自动警告（编辑 记忆/监督规则.md 可调整）\n")
+	b.WriteString("- 错误检索: 匹配高频错误历史，推送解决方案\n")
+	b.WriteString("- 习惯推送: 协作偏好自动推荐工作流程\n")
+	b.WriteString("- 知识注入: 按话题关键词检索相关知识库\n\n")
+
+	// 2. Active rules
+	b.WriteString("## 📋 生效规则\n")
+	rulesData, _ := os.ReadFile(filepath.Join(vaultPath, "记忆", "监督规则.md"))
+	parseActiveRules(string(rulesData), &b)
+
+	// 3. Recent errors
+	b.WriteString("## 🔥 高频错误\n")
+	errData, _ := os.ReadFile(filepath.Join(vaultPath, "记忆", "错误库.md"))
+	parseTopErrors(string(errData), &b, 3)
+
+	// 4. Quality habits
+	b.WriteString("## 💡 可用习惯\n")
+	habData, _ := os.ReadFile(filepath.Join(vaultPath, "记忆", "习惯库.md"))
+	parseTopHabits(string(habData), &b, 3)
+
+	// 5. Progress snapshot
+	snapData, err := os.ReadFile(filepath.Join(vaultPath, "系统设计", "状态快照.md"))
+	if err == nil {
+		b.WriteString("## 📊 当前进度\n")
+		raw := string(snapData)
+		if strings.HasPrefix(raw, "---") {
+			if end := strings.Index(raw[3:], "---"); end > 0 {
+				raw = raw[3+end+3:]
+			}
+		}
+		currentSec := ""
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "## ") {
+				currentSec = line[3:]
+			} else if (currentSec == "当前话题" || currentSec == "已完成的" || currentSec == "进行中" || currentSec == "下一步" || currentSec == "下一步 (推荐)") && strings.HasPrefix(line, "- ") {
+				b.WriteString("  " + line[:min(100, len(line))] + "\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func parseActiveRules(data string, b *strings.Builder) {
+	currentName := ""
+	enabled := false
+	solution := ""
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## ") && !strings.Contains(line, " #") {
+			if enabled && solution != "" {
+				b.WriteString(fmt.Sprintf("- %s: %s\n", currentName, solution[:min(80,len(solution))]))
+			}
+			currentName = line[3:]
+			enabled = false; solution = ""
+		}
+		if strings.Contains(line, "启用:") && strings.Contains(line, "true") && !strings.Contains(line, "false") {
+			enabled = true
+		}
+		if strings.Contains(line, "方案:") {
+			solution = strings.TrimSpace(strings.SplitN(line, "方案:", 2)[1])
+		}
+	}
+	if enabled && solution != "" {
+		b.WriteString(fmt.Sprintf("- %s: %s\n", currentName, solution[:min(80,len(solution))]))
+	}
+	b.WriteString("\n")
+}
+
+func parseTopErrors(data string, b *strings.Builder, maxN int) {
+	type errEntry struct{ name string; count int; fix string }
+	var errs []errEntry
+	var cur errEntry
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## #") {
+			if cur.count > 0 { errs = append(errs, cur) }
+			cur = errEntry{name: line[3:]}
+		}
+		if strings.Contains(line, "次数：") && cur.name != "" {
+			s := strings.SplitN(line, "次数：", 2)
+			if len(s) > 1 {
+				ns := strings.TrimSpace(strings.TrimRight(s[1], "*"))
+				if n, e := strconv.Atoi(ns); e == nil { cur.count = n }
+			}
+		}
+		if strings.Contains(line, "解决：") && cur.name != "" {
+			s := strings.SplitN(line, "解决：", 2)
+			if len(s) > 1 { cur.fix = strings.TrimSpace(strings.TrimRight(s[1], "*")); if len(cur.fix) > 80 { cur.fix = cur.fix[:80] } }
+		}
+	}
+	if cur.count > 0 { errs = append(errs, cur) }
+	// Sort by count descending (simple bubble for small N)
+	for i := 0; i < len(errs); i++ {
+		for j := i+1; j < len(errs); j++ {
+			if errs[j].count > errs[i].count { errs[i], errs[j] = errs[j], errs[i] }
+		}
+	}
+	for i := 0; i < len(errs) && i < maxN; i++ {
+		b.WriteString(fmt.Sprintf("- %s (%d次): %s\n", errs[i].name, errs[i].count, errs[i].fix[:min(60,len(errs[i].fix))]))
+	}
+	b.WriteString("\n")
+}
+
+func parseTopHabits(data string, b *strings.Builder, maxN int) {
+	type habEntry struct{ name string; tmpl string }
+	var habs []habEntry
+	var cur habEntry
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## [") && !strings.Contains(line[:min(50,len(line))], "{") {
+			if cur.tmpl != "" { habs = append(habs, cur) }
+			cur = habEntry{name: line[3:]}
+		}
+		if strings.Contains(line, "模板：") && cur.name != "" {
+			t := strings.SplitN(line, "模板：", 2)
+			if len(t) > 1 {
+				tpl := strings.TrimSpace(strings.TrimRight(t[1], "*"))
+				if tpl != "" && tpl != "(待提炼)" { cur.tmpl = tpl }
+			}
+		}
+	}
+	if cur.tmpl != "" { habs = append(habs, cur) }
+	for i := 0; i < len(habs) && i < maxN; i++ {
+		b.WriteString(fmt.Sprintf("- %s: %s\n", habs[i].name[:min(60,len(habs[i].name))], habs[i].tmpl[:min(80,len(habs[i].tmpl))]))
+	}
+	b.WriteString("\n")
+}
+
+// ── Knowledge search ──
+
+type knowledgeEntry struct {
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+	Tags    []string `json:"tags"`
+	Path    string `json:"path"`
+}
+
+type knowledgeIndex struct {
+	Entries map[string]knowledgeEntry `json:"entries"`
+}
+
+func searchKnowledge(query string, topK int) []knowledgeEntry {
+	idxPath := filepath.Join(os.Getenv("USERPROFILE"), ".reasonix", "knowledge_index.json")
+	data, err := os.ReadFile(idxPath)
+	if err != nil { return nil }
+
+	var idx knowledgeIndex
+	if err := json.Unmarshal(data, &idx); err != nil { return nil }
+
+	type scored struct {
+		e knowledgeEntry
+		s int
+	}
+	var results []scored
+	qWords := strings.Fields(strings.ToLower(query))
+
+	for _, e := range idx.Entries {
+		score := 0
+		titleL := strings.ToLower(e.Title)
+		summaryL := strings.ToLower(e.Summary)
+		for _, w := range qWords {
+			if strings.Contains(titleL, w) { score += 10 }
+			if strings.Contains(summaryL, w) { score += 3 }
+			for _, t := range e.Tags {
+				if strings.Contains(strings.ToLower(t), w) { score += 5 }
+			}
+		}
+		if score > 0 { results = append(results, scored{e, score}) }
+	}
+
+	// Sort by score
+	for i := 0; i < len(results); i++ {
+		for j := i+1; j < len(results); j++ {
+			if results[j].s > results[i].s { results[i], results[j] = results[j], results[i] }
+		}
+	}
+
+	var out []knowledgeEntry
+	for i := 0; i < len(results) && i < topK; i++ {
+		out = append(out, results[i].e)
+	}
+	return out
+}
+
+
+func logViolation(toolName string, resp []byte) {
+	var v violation
+	if err := json.Unmarshal(resp, &v); err != nil {
+		return
+	}
+	now := time.Now().Format("2006-01-02 15:04:05")
+	entry := fmt.Sprintf("\n## 🚨 %s\n- **Tool:** `%s`\n- **Rule:** %s\n- **Detail:** %s\n- **Solution:** %s\n---\n", now, toolName, v.Rule, v.Detail, v.Solution)
+	f, err := os.OpenFile(supervisionLog, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err == nil {
+		f.WriteString(entry)
+		f.Close()
+	}
 }
 
 // ── Bot Sync ──
+
 var (
 	botState = make(map[string]int)
 	stateMu  sync.Mutex
@@ -209,7 +1031,6 @@ func syncBotLogs() {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	today := time.Now().Format("2006-01-02")
-
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "bot-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
@@ -230,7 +1051,6 @@ func syncBotLogs() {
 		if total <= known {
 			continue
 		}
-
 		var dst string
 		header := string(data[:min(2000, len(data))])
 		if strings.Contains(header, "花火") || strings.Contains(header, "Sparkle") {
@@ -238,7 +1058,6 @@ func syncBotLogs() {
 		} else {
 			dst = qqLogPath
 		}
-
 		var out []string
 		for _, line := range lines[known:] {
 			line = strings.TrimSpace(line)
@@ -284,129 +1103,8 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// ── 违规检测 ──
-var vaultPathExcluded bool // 是否已排除 vault 路径
-
-type toolEvent struct {
-	Event    string         `json:"event"`
-	ToolName string         `json:"toolName"`
-	ToolArgs map[string]any `json:"toolArgs"`
-}
-
-type violation struct {
-	Violated      bool   `json:"violated"`
-	Rule          string `json:"rule,omitempty"`
-	Detail        string `json:"detail,omitempty"`
-	Solution      string `json:"solution,omitempty"`
-	SystemMessage string `json:"systemMessage,omitempty"`
-}
-
-func isVaultPath(s string) bool {
-	abs, _ := filepath.Abs(s)
-	return strings.Contains(abs, vaultPath) || strings.Contains(abs, "个人数据\\辞玖")
-}
-
-func hasChinese(s string) bool {
-	for _, r := range s {
-		if r >= 0x4e00 && r <= 0x9fff {
-			return true
-		}
-	}
-	return false
-}
-
-func checkToolCall(toolName string, toolArgs map[string]any) *violation {
-	tl := strings.ToLower(toolName)
-
-	// Loop detection
-	if checkLoop(toolName) {
-		return &violation{
-			Violated: true, Rule: "Loop detection",
-			Detail:      fmt.Sprintf("%s called 3+ times", toolName),
-			Solution:    "Change approach or check preconditions",
-			SystemMessage: fmt.Sprintf("⚠️ Supervisor: loop detected on %s", toolName),
-		}
-	}
-
-	// GBK encoding check - skip if args contain vault path
-	if tl == "bash" || tl == "echo" || tl == "powershell" || tl == "cmd" {
-		for _, v := range toolArgs {
-			if s, ok := v.(string); ok && hasChinese(s) && !isVaultPath(s) {
-				return &violation{
-					Violated: true, Rule: "GBK encoding",
-					Detail:   "Command args contain CJK chars outside vault path",
-					Solution: "Set encoding=utf-8 or pass via env var",
-					SystemMessage: fmt.Sprintf("⚠️ Supervisor: GBK risk on %s", toolName),
-				}
-			}
-		}
-	}
-
-	// Chinese path check - skip vault paths
-	if tl == "write_file" || tl == "edit_file" || tl == "read_file" || tl == "glob" || tl == "grep" {
-		if p, ok := toolArgs["path"].(string); ok {
-			if hasChinese(p) && !isVaultPath(p) {
-				return &violation{
-					Violated: true, Rule: "Chinese file path",
-					Detail:   "CJK path outside vault",
-					Solution: "Use ASCII paths or verify encoding",
-					SystemMessage: fmt.Sprintf("⚠️ Supervisor: Chinese path on %s", toolName),
-				}
-			}
-			// Backup check
-			if tl == "write_file" {
-				ext := strings.ToLower(filepath.Ext(p))
-				if ext == ".toml" || ext == ".json" || ext == ".yaml" || ext == ".yml" {
-					return &violation{
-						Violated: true, Rule: "Backup before overwrite",
-						Detail:   fmt.Sprintf("Writing %s without backup", p),
-						Solution:  fmt.Sprintf("Copy-Item '%s' '%s.bak'", p, p),
-						SystemMessage: fmt.Sprintf("⚠️ Supervisor: backup %s", p),
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	data := make([]byte, 65536)
-	n, err := conn.Read(data)
-	if err != nil {
-		return
-	}
-	var evt toolEvent
-	if err := json.Unmarshal(data[:n], &evt); err != nil {
-		return
-	}
-	if evt.Event != "PreToolUse" {
-		conn.Write([]byte(`{"violated":false}`))
-		return
-	}
-	v := checkToolCall(evt.ToolName, evt.ToolArgs)
-	if v != nil {
-		resp, _ := json.Marshal(v)
-		conn.Write(resp)
-		logViolation(evt.ToolName, v)
-	} else {
-		conn.Write([]byte(`{"violated":false}`))
-	}
-}
-
-func logViolation(toolName string, v *violation) {
-	now := time.Now().Format("2006-01-02 15:04:05")
-	entry := fmt.Sprintf("\n## 🚨 %s\n- **Tool:** `%s`\n- **Rule:** %s\n- **Detail:** %s\n- **Solution:** %s\n---\n", now, toolName, v.Rule, v.Detail, v.Solution)
-	f, err := os.OpenFile(supervisionLog, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-	if err == nil {
-		f.WriteString(entry)
-		f.Close()
-	}
-}
-
 // ── Lifecycle ──
+
 func isReasonixRunning() bool {
 	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq reasonix.exe", "/NH")
 	out, err := cmd.Output()
@@ -425,630 +1123,13 @@ func isBotWindowOpen() bool {
 	return strings.Contains(string(out), "cmd.exe")
 }
 
-// ════════════════════════════════════════════════════════════════════
-// Writer (Obsidian) — port 49520
-// ════════════════════════════════════════════════════════════════════
-
-// writerEvent is the JSON payload received on the writer TCP port.
-type writerEvent struct {
-	Event     string         `json:"event"`
-	SessionID string         `json:"session_id,omitempty"`
-	Session   string         `json:"session,omitempty"`
-	Ts        string         `json:"ts,omitempty"`
-	Cwd       string         `json:"cwd,omitempty"`
-	Model     string         `json:"model,omitempty"`
-	ToolName  string         `json:"toolName,omitempty"`
-	ToolArgs  map[string]any `json:"toolArgs,omitempty"`
-	ToolResult string        `json:"toolResult,omitempty"`
-	Prompt    string         `json:"prompt,omitempty"`
-	Message   string         `json:"message,omitempty"`
-	Content   string         `json:"content,omitempty"`
-	Level     string         `json:"level,omitempty"`
-	Turn      int            `json:"turn,omitempty"`
-	Trigger   string         `json:"trigger,omitempty"`
-}
-
-// ── Writer state ──
-
-var (
-	// open file handles: key -> *os.File
-	openFiles   = make(map[string]*os.File)
-	openFilesMu sync.Mutex
-
-	// current topic tracking
-	currentTopic   string
-	currentTopicMu sync.Mutex
-
-	// session-level hot cache
-	sessionErrors   []string
-	sessionDecisions []string
-	sessionPrompts  []string
-	sessionTopics   []string
-	sessionMu       sync.Mutex
-)
-
-// topic marker regex: matches "── 话题分隔: xxx ──" or "-- 话题分隔：xxx --" etc.
-var topicPattern = regexp.MustCompile(`[─\-—]{2,}\s*话题分隔\s*[:：]\s*(.+?)\s*[─\-—]{2,}`)
-
-// error-like looking prefixes (lowercase)
-var errorPrefixes = []string{
-	"error:", "error ", "exception:", "traceback", "panic:", "fatal:",
-	"syntaxerror", "importerror", "typeerror", "valueerror", "keyerror",
-}
-
-func looksLikeError(text string) bool {
-	if text == "" {
-		return false
-	}
-	lower := strings.TrimLeft(strings.ToLower(text), " \t")
-	if len(lower) > 300 {
-		lower = lower[:300]
-	}
-	for _, p := range errorPrefixes {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-// parseTopicMarker returns the topic name if a marker is found in text, else "".
-func parseTopicMarker(text string) string {
-	if text == "" {
-		return ""
-	}
-	m := topicPattern.FindStringSubmatch(text)
-	if len(m) > 1 {
-		return strings.TrimSpace(m[1])
-	}
-	return ""
-}
-
-// getRawHandle returns an open file handle for today's raw timeline.
-func getRawHandle(date time.Time) (*os.File, string) {
-	rawDir := filepath.Join(vaultPath, "reasonix-raw")
-	os.MkdirAll(rawDir, 0755)
-	dateStr := date.Format("2006-01-02")
-	filePath := filepath.Join(rawDir, dateStr+".md")
-	key := "raw:" + dateStr
-
-	openFilesMu.Lock()
-	defer openFilesMu.Unlock()
-
-	if fh, ok := openFiles[key]; ok && fh != nil {
-		return fh, filePath
-	}
-	fh, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		writeLog("writer: cannot open raw file %s: %v", filePath, err)
-		return nil, filePath
-	}
-	openFiles[key] = fh
-	return fh, filePath
-}
-
-// getTopicHandle returns an open file handle for a topic file.
-func getTopicHandle(topicName string, topicDir string) (*os.File, string, string) {
-	// sanitize filename
-	safe := topicName
-	replacer := strings.NewReplacer(
-		"\\", "", "/", "", ":", "", "*", "", "?", "", "\"", "", "<", "", ">", "", "|", "",
-	)
-	safe = replacer.Replace(safe)
-	safe = strings.TrimSpace(safe)
-	if safe == "" {
-		safe = "unknown-topic"
-	}
-	if len([]rune(safe)) > 80 {
-		safe = string([]rune(safe)[:80])
-	}
-
-	os.MkdirAll(topicDir, 0755)
-	os.MkdirAll(topicDir, 0755)
-	filePath := filepath.Join(topicDir, safe+".md")
-	key := "topic:" + safe
-
-	openFilesMu.Lock()
-	defer openFilesMu.Unlock()
-
-	if fh, ok := openFiles[key]; ok && fh != nil {
-		return fh, filePath, safe
-	}
-	fh, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		writeLog("writer: cannot open topic file %s: %v", filePath, err)
-		return nil, filePath, safe
-	}
-	openFiles[key] = fh
-	return fh, filePath, safe
-}
-
-// closeHandle closes and removes an open file handle by key.
-func closeHandle(key string) {
-	openFilesMu.Lock()
-	defer openFilesMu.Unlock()
-	if fh, ok := openFiles[key]; ok && fh != nil {
-		fh.Close()
-		delete(openFiles, key)
-	}
-}
-
-// appendFile writes text to an already-open file, ensuring it's flushed.
-func appendFile(fh *os.File, text string) {
-	if fh == nil {
-		return
-	}
-	fh.WriteString(text)
-	fh.Sync()
-}
-
-// writeHotCache writes the session hot cache to 记忆/热缓存.md.
-func writeHotCache(sessionID string) {
-	hotPath := filepath.Join(vaultPath, "记忆", "热缓存.md")
-	os.MkdirAll(filepath.Dir(hotPath), 0755)
-	now := time.Now()
-	dateStr := now.Format("2006-01-02")
-
-	sessionMu.Lock()
-	errors := copyStrings(sessionErrors)
-	decisions := copyStrings(sessionDecisions)
-	prompts := copyStrings(sessionPrompts)
-	topics := copyStrings(sessionTopics)
-	// Clear
-	sessionErrors = nil
-	sessionDecisions = nil
-	sessionPrompts = nil
-	sessionTopics = nil
-	sessionMu.Unlock()
-
-	var parts []string
-	parts = append(parts, "---\n")
-	parts = append(parts, fmt.Sprintf("updated: %s\n", dateStr))
-	parts = append(parts, "tags: [reasonix/hotcache]\n")
-	parts = append(parts, "---\n\n")
-	parts = append(parts, "# 热缓存\n\n")
-
-	if len(topics) > 0 {
-		parts = append(parts, "## 当前活跃话题\n")
-		for _, t := range topics {
-			safe := strings.NewReplacer("[", "", "]", "").Replace(t)
-			parts = append(parts, fmt.Sprintf("- [[话题/%s]] — 活跃中\n", safe))
-		}
-		parts = append(parts, "\n")
-	}
-
-	if len(decisions) > 0 {
-		parts = append(parts, "## 最近关键决策\n")
-		for _, d := range lastN(decisions, 3) {
-			parts = append(parts, fmt.Sprintf("- %s\n", d))
-		}
-		parts = append(parts, "\n")
-	}
-
-	if len(prompts) > 0 {
-		parts = append(parts, "## 待接续\n")
-		for _, p := range lastN(prompts, 3) {
-			parts = append(parts, fmt.Sprintf("- %s\n", p))
-		}
-		parts = append(parts, "\n")
-	}
-
-	if len(errors) > 0 {
-		parts = append(parts, "## 最近错误\n")
-		for _, e := range lastN(errors, 3) {
-			parts = append(parts, fmt.Sprintf("- %s\n", e))
-		}
-		parts = append(parts, "\n")
-	}
-
-	body := strings.Join(parts, "")
-	fh, err := os.OpenFile(hotPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if err != nil {
-		writeLog("writer: hot cache write error: %v", err)
-		return
-	}
-	defer fh.Close()
-	fh.WriteString(body)
-	fh.Sync()
-	writeLog("writer: hot cache written: %s", hotPath)
-}
-
-func copyStrings(src []string) []string {
-	dst := make([]string, len(src))
-	copy(dst, src)
-	return dst
-}
-
-func lastN(s []string, n int) []string {
-	if len(s) <= n {
-		return s
-	}
-	return s[len(s)-n:]
-}
-
-// ensureRawHeader writes the day header if the raw file is empty.
-func ensureRawHeader(fh *os.File, filePath, dateCompact string) {
-	if fh == nil {
-		return
-	}
-	info, err := os.Stat(filePath)
-	if err != nil || info.Size() == 0 {
-		appendFile(fh, fmt.Sprintf("# %s 原始时间线\n\n", dateCompact))
-	}
-}
-
-// ensureTopicHeader writes the front matter if the topic file is empty.
-func ensureTopicHeader(fh *os.File, filePath, topicName, dateCompact string) {
-	if fh == nil {
-		return
-	}
-	info, err := os.Stat(filePath)
-	if err != nil || info.Size() == 0 {
-		header := fmt.Sprintf("---\ncreated: %s\ntags: [reasonix/topic, reasonix/active]\nstatus: 活跃\n---\n\n# %s\n\n", dateCompact, topicName)
-		appendFile(fh, header)
-	}
-}
-
-// processWriterEvent handles one writer event: writes to raw timeline and topic file.
-
-var nsfwKeywords = []string{"nsfw", "NSFW", "R18", "成人", "色情", "H场景", "H事件", "18禁"}
-
-func isNSFWTopic(topicName string) bool {
-	topicLower := strings.ToLower(topicName)
-	for _, kw := range nsfwKeywords {
-		if strings.Contains(topicLower, strings.ToLower(kw)) {
-			return true
-		}
-	}
-	return false
-}
-
-func getTopicDir(topicName string) string {
-	if isNSFWTopic(topicName) {
-		return filepath.Join(vaultPath, "个人", "话题")
-	}
-	return filepath.Join(vaultPath, "话题")
-}
-
-func processWriterEvent(payload writerEvent) {
-	event := payload.Event
-	if event == "" {
-		return
-	}
-
-	// Parse timestamp
-	ts := payload.Ts
-	var dt time.Time
-	if ts != "" {
-		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-			dt = parsed
-		} else if parsed, err := time.Parse("2006-01-02T15:04:05", ts); err == nil {
-			dt = parsed
-		} else if parsed, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
-			dt = parsed
-		} else {
-			dt = time.Now()
-		}
-	} else {
-		dt = time.Now()
-	}
-	date := dt
-	timestamp := dt.Format("15:04:05")
-	dateStr := dt.Format("2006-01-02 15:04")
-	dateCompact := dt.Format("2006-01-02")
-
-	sessionID := payload.SessionID
-	if sessionID == "" {
-		sessionID = payload.Session
-	}
-	if sessionID == "" {
-		sessionID = "unknown"
-	}
-
-	toolName := payload.ToolName
-	toolArgs := payload.ToolArgs
-	toolResult := payload.ToolResult
-	prompt := payload.Prompt
-	msg := payload.Message
-	content := payload.Content
-	level := payload.Level
-
-	// Detect topic marker from content, prompt, toolArgs, toolResult
-	topicFromMarker := ""
-	for _, src := range []string{content, prompt, mapToJSON(toolArgs), toolResult} {
-		if src != "" {
-			t := parseTopicMarker(src)
-			if t != "" {
-				topicFromMarker = t
-				break
-			}
-		}
-	}
-
-	currentTopicMu.Lock()
-	if topicFromMarker != "" {
-		currentTopic = topicFromMarker
-	}
-	curTopic := currentTopic
-	currentTopicMu.Unlock()
-
-	// Track in session
-	if curTopic != "" {
-		sessionMu.Lock()
-		found := false
-		for _, t := range sessionTopics {
-			if t == curTopic {
-				found = true
-				break
-			}
-		}
-		if !found {
-			sessionTopics = append(sessionTopics, curTopic)
-		}
-		sessionMu.Unlock()
-	}
-
-	// ── Build raw timeline entry ──
-	rawLabel := event
-	rawLine := ""
-
-	switch event {
-	case "SessionStart":
-		cwd := payload.Cwd
-		model := payload.Model
-		rawLabel = "会话开始"
-		rawLine = fmt.Sprintf("Session: %s  |  cwd: %s  |  model: %s", sessionID, cwd, model)
-
-	case "SessionEnd":
-		rawLabel = "会话结束"
-		rawLine = fmt.Sprintf("Session: %s", sessionID)
-		writeHotCache(sessionID)
-
-	case "UserPromptSubmit":
-		rawLabel = "用户提问"
-		rawLine = truncate(prompt, 300)
-		if prompt != "" {
-			sessionMu.Lock()
-			sessionPrompts = append(sessionPrompts, truncate(prompt, 120))
-			if len(sessionPrompts) > 5 {
-				sessionPrompts = sessionPrompts[1:]
-			}
-			sessionMu.Unlock()
-		}
-
-	case "PreToolUse":
-		rawLabel = "工具调用"
-		rawLine = fmt.Sprintf("%s %s", toolName, mapToJSON(toolArgs))
-
-	case "PostToolUse":
-		isErr := looksLikeError(toolResult)
-		if isErr {
-			rawLabel = "工具错误"
-		} else {
-			rawLabel = "工具结果"
-		}
-		preview := toolResult
-		if preview == "" {
-			preview = "(no return)"
-		}
-		rawLine = fmt.Sprintf("%s -> %s", toolName, truncate(preview, 200))
-		if isErr && toolName != "" {
-			errSummary := fmt.Sprintf("%s: %s", toolName, truncate(preview, 100))
-			sessionMu.Lock()
-			sessionErrors = append(sessionErrors, errSummary)
-			if len(sessionErrors) > 10 {
-				sessionErrors = sessionErrors[1:]
-			}
-			sessionMu.Unlock()
-		}
-
-	case "Stop":
-		turn := payload.Turn
-		rawLabel = "Turn 完成"
-		rawLine = fmt.Sprintf("Turn %d", turn)
-
-	case "Checkpoint":
-		rawLabel = fmt.Sprintf("检查点 (%s)", level)
-		rawLine = truncate(content, 300)
-		if content != "" {
-			sessionMu.Lock()
-			sessionDecisions = append(sessionDecisions, truncate(content, 120))
-			if len(sessionDecisions) > 8 {
-				sessionDecisions = sessionDecisions[1:]
-			}
-			sessionMu.Unlock()
-		}
-
-	case "PreCompact":
-		rawLabel = "上下文压缩"
-		trigger := payload.Trigger
-		if trigger == "" {
-			trigger = "auto"
-		}
-		rawLine = fmt.Sprintf("trigger: %s", trigger)
-
-	case "Notification":
-		rawLabel = "通知"
-		rawLine = truncate(msg, 300)
-
-	case "PostLLMCall":
-		rawLabel = "模型输出"
-		reply := toolResult
-		if reply == "" {
-			reply = payload.Message
-		}
-		rawLine = truncate(strings.ReplaceAll(reply, "\n", " "), 200)
-
-	case "SubagentStop":
-		rawLabel = "子任务完成"
-		rawLine = ""
-
-	case "PermissionRequest":
-		rawLabel = "权限请求"
-		rawLine = toolName
-
-	default:
-		rawLabel = event
-		rawLine = truncate(content, 300)
-	}
-
-	// 1) Write raw timeline
-	fhRaw, rawPath := getRawHandle(date)
-	if fhRaw != nil {
-		ensureRawHeader(fhRaw, rawPath, dateCompact)
-		rawMD := fmt.Sprintf("## %s %s\n%s\n\n", timestamp, rawLabel, rawLine)
-		appendFile(fhRaw, rawMD)
-	}
-
-	// 2) Write topic file if we have a current topic
-	if curTopic == "" {
-		return
-	}
-
-	fhTopic, topicPath, safeName := getTopicHandle(curTopic, getTopicDir(curTopic))
-	if fhTopic == nil {
-		return
-	}
-
-	ensureTopicHeader(fhTopic, topicPath, curTopic, dateCompact)
-
-	// Build topic content
-	var topicParts []string
-	topicParts = append(topicParts, fmt.Sprintf("## %s | 来自会话 %s\n\n", dateStr, sessionID))
-
-	switch event {
-	case "SessionStart":
-		cwd := payload.Cwd
-		model := payload.Model
-		topicParts = append(topicParts, fmt.Sprintf("**会话开始** | cwd: %s | model: %s\n", cwd, model))
-
-	case "SessionEnd":
-		topicParts = append(topicParts, "**→ 会话结束**\n")
-		closeHandle("topic:" + safeName)
-
-	case "UserPromptSubmit":
-		topicParts = append(topicParts, fmt.Sprintf("**用户提问:** %s\n", prompt))
-
-	case "PreToolUse":
-		argsPreview := mapToJSON(toolArgs)
-		topicParts = append(topicParts, fmt.Sprintf("**工具调用:** %s\n  参数: %s\n", toolName, truncate(argsPreview, 300)))
-
-	case "PostToolUse":
-		isErr := looksLikeError(toolResult)
-		preview := truncate(toolResult, 300)
-		if preview == "" {
-			preview = "(无返回)"
-		}
-		if isErr {
-			topicParts = append(topicParts, fmt.Sprintf("**❌ 工具错误** %s:\n  `\n%s\n  `\n", toolName, preview))
-			topicParts = append(topicParts, fmt.Sprintf("→ ❌ 错误: %s\n", truncate(toolResult, 200)))
-		} else {
-			topicParts = append(topicParts, fmt.Sprintf("**✅ 工具完成** %s → %s\n", toolName, preview))
-		}
-
-	case "Stop":
-		turn := payload.Turn
-		topicParts = append(topicParts, fmt.Sprintf("**Turn %d 完成**\n", turn))
-
-	case "Checkpoint":
-		emojiMap := map[string]string{"milestone": "🎯", "progress": "📊", "blocker": "🚧"}
-		emoji := "📌"
-		if e, ok := emojiMap[level]; ok {
-			emoji = e
-		}
-		// Remove topic markers from content
-		clean := topicPattern.ReplaceAllString(content, "")
-		clean = strings.TrimSpace(clean)
-		topicParts = append(topicParts, fmt.Sprintf("**%s 检查点 (%s):** %s\n", emoji, level, clean))
-
-	case "PreCompact":
-		trigger := payload.Trigger
-		if trigger == "" {
-			trigger = "auto"
-		}
-		topicParts = append(topicParts, fmt.Sprintf("**📦 上下文压缩** (触发: %s)\n", trigger))
-
-	case "Notification":
-		topicParts = append(topicParts, fmt.Sprintf("**通知:** %s\n", msg))
-
-	case "PostLLMCall":
-		reply := toolResult
-		if reply == "" {
-			reply = payload.Message
-		}
-		preview := truncate(strings.ReplaceAll(reply, "\n", " "), 300)
-		topicParts = append(topicParts, fmt.Sprintf("**🤖 模型输出:** %s\n", preview))
-
-	case "SubagentStop":
-		topicParts = append(topicParts, "**🔄 子任务完成**\n")
-
-	case "PermissionRequest":
-		topicParts = append(topicParts, fmt.Sprintf("**🔒 权限请求:** %s\n", toolName))
-
-	default:
-		topicParts = append(topicParts, fmt.Sprintf("**事件 %s:** %s\n", event, truncate(content, 200)))
-	}
-
-	topicParts = append(topicParts, "\n---\n\n")
-	appendFile(fhTopic, strings.Join(topicParts, ""))
-
-	if event == "SessionEnd" {
-		closeHandle("raw:" + dateCompact)
-	}
-}
-
-func mapToJSON(m map[string]any) string {
-	if m == nil {
-		return ""
-	}
-	b, _ := json.Marshal(m)
-	return string(b)
-}
-
-func handleWriterConn(conn net.Conn) {
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	data := make([]byte, 65536)
-	n, err := conn.Read(data)
-	if err != nil {
-		return
-	}
-	var evt writerEvent
-	if err := json.Unmarshal(data[:n], &evt); err != nil {
-		return
-	}
-	processWriterEvent(evt)
-	conn.Write([]byte(`{"ok":true}`))
-}
-
-func startWriterServer() {
-	for {
-		listener, err := net.Listen("tcp", "127.0.0.1"+writerPort)
-		if err != nil {
-			writeLog("writer bind %s failed: %v, retry in 10s", writerPort, err)
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		writeLog("writer listening on %s", writerPort)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				writeLog("writer accept error: %v", err)
-				listener.Close()
-				break
-			}
-			go handleWriterConn(conn)
-		}
-	}
-}
-
-// ── Supervisor TCP server (port 49522) ──
+// ── TCP servers ──
 
 func startSupervisorServer() {
 	for {
 		listener, err := net.Listen("tcp", "127.0.0.1"+port)
 		if err != nil {
-			writeLog("supervisor bind %s failed: %v, retry in 10s", port, err)
+			writeLog("supervisor bind %s failed: %v, retry", port, err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -1056,20 +1137,21 @@ func startSupervisorServer() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				writeLog("supervisor accept error: %v, restarting listener", err)
+				writeLog("supervisor accept error: %v, restarting", err)
 				listener.Close()
 				break
 			}
-			go handleConnection(conn)
+			go handleSupervisorConn(conn)
 		}
 	}
 }
 
 // ── Main ──
+
 func main() {
 	flag.StringVar(&vaultPath, "vault", "", "Obsidian vault path")
 	flag.StringVar(&writerPort, "writer-port", ":49520", "Writer TCP port")
-	flag.StringVar(&port, "port", ":49522", "TCP listen port (supervisor)")
+	flag.StringVar(&port, "port", ":49522", "Supervisor TCP port")
 	flag.StringVar(&botSessionsDir, "bot-dir", "", "Bot sessions directory")
 	flag.Parse()
 
@@ -1080,10 +1162,9 @@ func main() {
 		botSessionsDir = "C:\\Users\\20900\\AppData\\Roaming\\reasonix\\projects\\C--Users-20900-DeepSeek-Reasonix\\sessions"
 	}
 	stateFile = filepath.Join(os.Getenv("USERPROFILE"), ".reasonix", "logs", "bot_sync_state.json")
-
 	initPaths()
 
-	// Check port conflict (supervisor port only; writer port checked by startWriterServer)
+	// Check port conflict
 	if conn, err := net.DialTimeout("tcp", "127.0.0.1"+port, 2*time.Second); err == nil {
 		conn.Close()
 		writeLog("port %s already in use, exiting", port)
@@ -1091,9 +1172,12 @@ func main() {
 	}
 
 	loadRules()
+	loadErrorLibrary(vaultPath)
+	loadHabitLibrary(vaultPath)
+	loadSupervisorRules(vaultPath)
 	loadBotState()
 
-	// Lifecycle: exit only when BOTH reasonix desktop AND bot window are closed
+	// Lifecycle monitor
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
@@ -1106,6 +1190,9 @@ func main() {
 		}
 	}()
 
+	// Start writer (port 49520) and bot sync
+	go startWriter(writerPort)
+
 	// Bot sync every 2s
 	go func() {
 		for {
@@ -1114,11 +1201,14 @@ func main() {
 		}
 	}()
 
-	// Reload rules every 5min
+	// Rules reload every 5min
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
 			loadRules()
+			loadErrorLibrary(vaultPath)
+			loadHabitLibrary(vaultPath)
+			loadSupervisorRules(vaultPath)
 		}
 	}()
 
@@ -1126,13 +1216,17 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(30 * time.Minute)
-			writeLog("health: running, rules=%d errors=%d", len(rules), len(errorPatterns))
+			writeLog("health: running, rules=%d err_patterns=%d rate_limiters=%d pending=%d",
+				len(rules), len(errorPatterns), len(rateLimiters), len(pendingQueue))
 		}
 	}()
 
-	// Start both TCP servers concurrently
-	go startWriterServer()
+	writeLog("started: vault=%s port=%s", vaultPath, port)
 	startSupervisorServer()
 }
+
+
+
+
 
 
