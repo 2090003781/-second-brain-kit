@@ -11,11 +11,46 @@
 
 **一键安装 · 实时写入 · 智能监督 · 自动关联**
 
+
+```mermaid
+flowchart TB
+    subgraph Agent["🤖 AI Agent"]
+        direction LR
+        A1["分析问题"]
+        A2["搜索知识"]
+        A3["推理方案"]
+    end
+
+    subgraph Nerve["⚡ 神经 hook_logger.py"]
+        N1["事件转发"]
+        N2["JSONL 降级"]
+    end
+
+    subgraph Brainlet["🧠 小脑 supervisor.exe (Go)"]
+        BL1["上下文注入"]
+        BL2["规则检查"]
+        BL3["知识检索"]
+    end
+
+    subgraph Brain["📓 大脑 Obsidian Vault"]
+        B1["规则 / 错误 / 习惯 / 经验"]
+        B2["知识库 (45篇)"]
+        B3["状态快照 / 话题日志"]
+    end
+
+    Agent -->|"stdin JSON"| Nerve
+    Nerve -->|"TCP :49520"| Brain
+    Nerve -->|"TCP :49522"| Brainlet
+    Brainlet -->|"systemMessage"| Agent
+    Brainlet -->|"读写"| Brain
+```
+
+
 </div>
 
 > An open-source toolkit that bridges AI coding agents with Obsidian, turning every AI session into structured, searchable knowledge inside your vault.
 >
-> 一套开源工具包，连接 AI 与 Obsidian，让每一次 AI 对话都自动沉淀为 vault 中结构化、可搜索的知识。
+> 实时长期记忆系统。让 AI agent 在每次会话后更了解你、少犯同样的错误。`SessionStart 自动注入记忆` `PreToolUse 实时监督` `知识索引实时更新` `~200 tokens 启动开销`
 
 ---
 
