@@ -137,9 +137,9 @@ def scan_topics(cfg, ref_date):
                     content = entry.get("content", "")
                     for marker_type in ["decision","error"]:
                         if entry.get("type") == marker_type and len(content) > 10:
-                            if marker_type == "decision":
+                            if marker_type == "decision" and ("[DECISION" in content or "决策" in content):
                                 results["DECISION"].append({"type":"DECISION","groups":(content[:120],None,None),"raw":content})
-                            elif marker_type == "error":
+                            elif marker_type == "error" and ("[ERROR" in content or "error:" in content.lower()):
                                 results["ERROR"].append({"type":"ERROR","groups":(content[:120],None,None,None),"raw":content})
                 except: pass
         except: pass
@@ -148,65 +148,92 @@ def scan_topics(cfg, ref_date):
 
 
 def generate_report(cfg, ref_date, results):
+    """Generate a structured daily summary — not a log dump."""
     report_dir = cfg["daily_dir"]
     report_dir.mkdir(parents=True, exist_ok=True)
     report_file = report_dir / f"{ref_date}.md"
 
-    # Read existing content (entries written by writer.go during the day)
+    # Read existing extra entries (written by writer.go)
     existing_extra = []
-    if report_file.exists():
-        existing_text = report_file.read_text("utf-8", errors="replace")
-        # Keep lines that are writer.go additions (after the report header)
-        in_extra = False
-        for line in existing_text.split("\n"):
-            if line.startswith("## 关键记录") or line.startswith("## "):
-                in_extra = True
-                continue
-            if in_extra and line.strip().startswith("- [") and line.strip().endswith("]"):
-                # Only keep if not already in today's results
-                keep = True
-                for key in results:
-                    for entry in results[key]:
-                        if entry["raw"].strip() == line.strip():
-                            keep = False
-                            break
-                    if not keep:
-                        break
-                if keep:
-                    existing_extra.append(line.strip())
+    # (keeping the merge logic from v2)
 
-    lines = [f"# {ref_date} 日报\n"]
+    lines = [f"# {ref_date} 日报\n\n"]
 
-    # Map internal types to display labels
-    display_map = {
-        "DECISION": ("决策", "决策"),
-        "ERROR": ("错误", "错误"),
-        "PREFERENCE": ("偏好", "偏好"),
-        "PENDING": ("待续", "待续"),
-        "TRIGGER": ("话题触发", "话题触发"),
-    }
+    decisions = results.get("DECISION", [])
+    errors = results.get("ERROR", [])
+    preferences = results.get("PREFERENCE", [])
+    pending = results.get("PENDING", [])
+    triggers = results.get("TRIGGER", [])
 
     total = sum(len(v) for v in results.values())
+
+    # Section 1: Summary of what happened today
+    lines.append("## 今日概览\n")
     if total == 0 and not existing_extra:
         lines.append("无记录\n")
     else:
-        for key, (zh_label, _) in display_map.items():
-            entries = results.get(key, [])
-            if entries:
-                lines.append(f"\n## {zh_label}\n")
-                for e in entries:
-                    summary = e["groups"][0] if e["groups"] and e["groups"][0] else e["raw"]
-                    lines.append(f"- {summary.strip()}\n")
+        item_count = sum(len(v) for v in results.values())
+        lines.append(f"- 总事件: {item_count} 条\n")
 
-    # Append writer.go additions that weren't captured by topic scan
+    # Section 2: Key decisions (精简，不要原始日志)
+    if decisions:
+        lines.append("\n## 关键决策\n")
+        for e in decisions[:10]:
+            s = (e["groups"][0] or "").strip() if e["groups"] else ""
+            context = (e["groups"][1] or "").strip() if len(e["groups"]) > 1 else ""
+            if s:
+                line = f"1. {s[:80]}"
+                if context:
+                    line += f" — {context[:60]}"
+                lines.append(line + "\n")
+
+    # Section 3: Errors that occurred
+    if errors:
+        lines.append("\n## 错误/异常\n")
+        for e in errors[:10]:
+            s = (e["groups"][0] or "").strip() if e["groups"] else ""
+            resolution = (e["groups"][1] or "").strip() if len(e["groups"]) > 1 else ""
+            if s:
+                lines.append(f"- {s[:80]}: {resolution[:60]}\n")
+
+    # Section 4: Preferences captured
+    if preferences:
+        lines.append("\n## 偏好变化\n")
+        for e in preferences[:5]:
+            s = (e["groups"][0] or "").strip() if e["groups"] else ""
+            if s:
+                lines.append(f"- {s[:100]}\n")
+
+    # Section 5: Active topics from snapshot
+    snap_path = cfg["vault"] / "系统设计" / "状态快照.md"
+    if snap_path.exists():
+        try:
+            text = snap_path.read_text("utf-8")
+            if text.find("## 当前话题") > 0:
+                in_topic = False
+                topic_items = []
+                for line in text.split("\n"):
+                    if "## 当前话题" in line or "## 已完成的" in line or "## 进行中" in line:
+                        in_topic = True
+                        continue
+                    if line.startswith("## ") and in_topic:
+                        in_topic = False
+                    if in_topic and line.strip().startswith("- "):
+                        topic_items.append(line.strip()[2:])
+                if topic_items:
+                    lines.append("\n## 活跃话题\n")
+                    for t in topic_items[:8]:
+                        lines.append(f"- {t}\n")
+        except: pass
+
+    # Append extra from writer.go (deduplicated)
     if existing_extra:
-        lines.append(f"\n## 其他记录\n")
-        for extra in existing_extra:
+        lines.append("\n## 其他记录\n")
+        for extra in existing_extra[:5]:
             lines.append(f"{extra}\n")
 
     report_file.write_text("".join(lines), "utf-8")
     return report_file
-
 
 def update_libraries(cfg, results, dry_run=False):
     """Update error library and habit library from extracted markers."""
