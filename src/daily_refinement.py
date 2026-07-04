@@ -19,6 +19,11 @@ def load_config():
         "errors_file": vault / "记忆" / "错误库.md",
         "habits_file": vault / "记忆" / "习惯库.md",
         "daily_dir": vault / "日报",
+        "bot_logs": {
+            "QQ-Bot": vault / "个人" / "Bot" / "QQ-Bot" / "日志.md",
+            "微信-Bot": vault / "个人" / "Bot" / "微信-Bot" / "日志.md",
+        },
+        "bot_report_dir": vault / "Bot-日报",
     }
 
 # ── New format patterns ──
@@ -98,16 +103,47 @@ def parse_entry_line(line: str, ref_date: str) -> dict | None:
 
 
 def scan_topics(cfg, ref_date):
+    """Scan reasonix-raw and JSONL logs for structured markers."""
+    import json as _json
     results = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
-    for f in sorted(cfg["topics_dir"].glob("*.md")):
-        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime).date()
-        if mtime.isoformat() != ref_date:
-            continue
-        text = f.read_text("utf-8", errors="replace")
-        for line in text.split("\n"):
-            entry = parse_entry_line(line, ref_date)
-            if entry:
-                results[entry["type"]].append(entry)
+    
+    # 1. Scan reasonix-raw directory
+    raw_dir = cfg["vault"] / "reasonix-raw"
+    if raw_dir.exists():
+        # New format: reasonix-raw/YYYY-MM-DD/*.md
+        dated_dir = raw_dir / ref_date
+        if dated_dir.exists():
+            for f in sorted(dated_dir.glob("*.md")):
+                text = f.read_text("utf-8", errors="replace")
+                for line in text.split("\n"):
+                    entry = parse_entry_line(line, ref_date)
+                    if entry: results[entry["type"]].append(entry)
+        # Old format: reasonix-raw/YYYY-MM-DD.md
+        old_file = raw_dir / f"{ref_date}.md"
+        if old_file.exists():
+            for line in old_file.read_text("utf-8", errors="replace").split("\n"):
+                entry = parse_entry_line(line, ref_date)
+                if entry: results[entry["type"]].append(entry)
+    
+    # 2. Scan JSONL logs for markers in content
+    logs_dir = Path.home() / ".reasonix" / "logs" / "sessions" / "raw"
+    date_prefix = ref_date.replace("-", "")
+    for f in sorted(logs_dir.glob(f"reasonix-{date_prefix}*.jsonl")):
+        try:
+            for line in f.read_text("utf-8", errors="replace").split("\n"):
+                if not line.strip(): continue
+                try:
+                    entry = _json.loads(line)
+                    content = entry.get("content", "")
+                    for marker_type in ["decision","error"]:
+                        if entry.get("type") == marker_type and len(content) > 10:
+                            if marker_type == "decision":
+                                results["DECISION"].append({"type":"DECISION","groups":(content[:120],None,None),"raw":content})
+                            elif marker_type == "error":
+                                results["ERROR"].append({"type":"ERROR","groups":(content[:120],None,None,None),"raw":content})
+                except: pass
+        except: pass
+    
     return results
 
 
@@ -269,6 +305,48 @@ def update_libraries(cfg, results, dry_run=False):
             habits_file.write_text(content, "utf-8")
             print(f"[daily] Habit library: {len(trigger_entries)} trigger(s) processed")
 
+
+def scan_bot_logs(cfg, ref_date):
+    """Scan bot log files for markers. Returns (bot_markers, bot_name_to_markers)."""
+    bot_results = {}
+    total_markers = 0
+    for bot_name, log_file in cfg.get("bot_logs", {}).items():
+        if not log_file.exists():
+            continue
+        markers = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
+        try:
+            text = log_file.read_text("utf-8", errors="replace")
+            for line in text.split("\n"):
+                entry = parse_entry_line(line, ref_date)
+                if entry:
+                    markers[entry["type"]].append(entry)
+                    total_markers += 1
+        except: pass
+        if sum(len(v) for v in markers.values()) > 0:
+            bot_results[bot_name] = markers
+    return bot_results, total_markers
+
+def generate_bot_report(cfg, ref_date, bot_results):
+    """Generate separate bot report per bot."""
+    report_dir = cfg.get("bot_report_dir", cfg["vault"] / "Bot-日报")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    display_map = {"DECISION": "决策", "ERROR": "错误", "PREFERENCE": "偏好", "PENDING": "待续"}
+    for bot_name, markers in bot_results.items():
+        report_file = report_dir / f"{ref_date}-{bot_name}.md"
+        lines = [f"# {ref_date} {bot_name} 日报\n\n"]
+        total = sum(len(v) for v in markers.values())
+        if total == 0:
+            lines.append("无记录\n")
+        else:
+            for key, zh in display_map.items():
+                entries = markers.get(key, [])
+                if entries:
+                    lines.append(f"\n## {zh}\n")
+                    for e in entries:
+                        s = e["groups"][0] if e["groups"] and e["groups"][0] else e["raw"]
+                        lines.append(f"- {s.strip()}\n")
+        report_file.write_text("".join(lines), "utf-8")
+        print(f"[daily] Bot report: {report_file} ({total} markers)")
 
 def main():
     parser = argparse.ArgumentParser()

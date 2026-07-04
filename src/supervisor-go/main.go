@@ -351,6 +351,20 @@ func isSelfCorrectingAction(toolName string, args map[string]any) bool {
 
 var feedbackPattern = regexp.MustCompile(`<!--\s*audit_feedback:\s*(false_positive|true_positive|ignore)\s*(?::\s*(.+?))?\s*-->`)
 
+func isErrorResult(text string) bool {
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	prefixes := []string{"error:", "error ", "exception:", "traceback", "panic:", "fatal:", "syntaxerror", "importerror", "typeerror"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseFeedback(text string) (kind, ruleHint string) {
 	m := feedbackPattern.FindStringSubmatch(text)
 	if len(m) > 1 {
