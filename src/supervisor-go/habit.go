@@ -1,191 +1,195 @@
-package main
+﻿package main
 
 import (
+	"sync"
+	"time"
 	"bufio"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
+// HabitEntry represents one behavioral habit entry.
 type HabitEntry struct {
-	ID       int
-	Title    string      // [编程] 配置修改
-	Domain   string      // 编程
-	Scene    string      // .toml, .conf, 配置
-	Keywords []string    // parsed from Scene
-	Template string      // 备份 → 编辑 → 验证 → 告知
-	Count    int
-	Threshold int        // 0-100, default 50
+	ID        int
+	Title   string
+	Domain  string
+	Count   int
+	Scenes  []string
+	Template  string
+	Source  string
+	Threshold int
+	CountOK    int // times AI followed this habit
 }
 
 var (
 	habitLibrary []*HabitEntry
-	habitMu      sync.RWMutex
-	// Per-habit sliding 5min counter for 50-80% matches
-	habitCounter   = make(map[int]*rateEntry)
-	habitCounterMu sync.Mutex
 )
 
 func loadHabitLibrary(vaultPath string) {
+	habitLibrary = nil
 	path := filepath.Join(vaultPath, "记忆", "习惯库.md")
 	f, err := os.Open(path)
 	if err != nil {
-		writeLog("habit: cannot open %s: %v", path, err)
+		writeLog("habits: cannot open %s: %v", path, err)
 		return
 	}
 	defer f.Close()
 
 	var current *HabitEntry
 	scanner := bufio.NewScanner(f)
-	id := 0
-	domainRe := regexp.MustCompile(`\[(.+?)\]`)
-
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		if strings.HasPrefix(line, "## [") {
-			if current != nil {
-				habitLibrary = append(habitLibrary, current)
+		if current != nil {
+				current.ID = nextHabitID()
+				current.ID = nextHabitID()
+		habitLibrary = append(habitLibrary, current)
 			}
-			id++
-			current = &HabitEntry{ID: id, Threshold: 50}
-			m := domainRe.FindStringSubmatch(line)
-			if len(m) > 1 {
-				current.Domain = m[1]
-			}
-			// Title after domain tag
-			parts := strings.SplitN(line, " ", 3)
-			if len(parts) >= 3 {
-				current.Title = parts[2]
+			current = &HabitEntry{CountOK: 0}
+			// Extract title after ## [Domain]
+			if idx := strings.Index(line, "] "); idx > 0 {
+				current.Title = strings.TrimSpace(line[idx+2:])
+				current.Domain = strings.TrimSpace(line[4:idx])
 			}
 			continue
 		}
-
 		if current == nil {
 			continue
 		}
 
 		if strings.Contains(line, "- **次数：") {
 			re := regexp.MustCompile(`\d+`)
-			m := re.FindString(line)
-			if m != "" {
+			if m := re.FindString(line); m != "" {
 				current.Count, _ = strconv.Atoi(m)
 			}
-		} else if strings.Contains(line, "- **触发场景：") {
-			v := extractValues(line)
-			current.Keywords = v
-			current.Scene = strings.Join(v, ", ")
+		} else if strings.Contains(line, "- **场景：") {
+			current.Scenes = commaSplit(line)
 		} else if strings.Contains(line, "- **模板：") {
-			v := extractValues(line)
-			if len(v) > 0 {
-				current.Template = v[0]
+			vals := commaSplit(line)
+			if len(vals) > 0 {
+				current.Template = vals[0]
 			}
-		} else if strings.Contains(line, "- **阈值：") {
-			re := regexp.MustCompile(`\d+`)
-			m := re.FindString(line)
-			if m != "" {
-				current.Threshold, _ = strconv.Atoi(m)
+		} else if strings.Contains(line, "- **来源：") {
+			vals := commaSplit(line)
+			if len(vals) > 0 {
+				current.Source = vals[0]
 			}
 		}
 	}
 	if current != nil {
+		current.ID = nextHabitID()
 		habitLibrary = append(habitLibrary, current)
 	}
-	writeLog("habit: loaded %d entries", len(habitLibrary))
+	writeLog("habits: loaded %d entries", len(habitLibrary))
 }
 
-// matchHabit returns the best matching habit entry and match score (0-100).
-func matchHabit(toolName string, args map[string]any) (*HabitEntry, int) {
-	habitMu.RLock()
-	defer habitMu.RUnlock()
+func commaSplit(line string) []string {
+	idx := strings.Index(line, "**：")
+	if idx < 0 {
+		idx = strings.Index(line, ":**")
+		if idx < 0 {
+			return nil
+		}
+		idx += 3
+	} else {
+		idx += 3
+	}
+	parts := strings.Split(line[idx:], ",")
+	var res []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			res = append(res, p)
+		}
+	}
+	return res
+}
 
-	// Build a search string from tool + args
-	search := strings.ToLower(toolName + " " + flattenArgs(args))
+// matchHabit checks if toolName+args match any habit scene.
+// Returns best matching habit and match percentage.
+func matchHabit(toolName string, args map[string]any) (*HabitEntry, int) {
+	tl := strings.ToLower(toolName)
+	argStr := ""
+	for _, v := range args {
+		if s, ok := v.(string); ok {
+			argStr += " " + s
+		}
+	}
+	argStr = strings.ToLower(argStr)
 
 	bestScore := 0
 	var best *HabitEntry
 
 	for _, h := range habitLibrary {
-		if len(h.Keywords) == 0 {
+		if len(h.Scenes) == 0 {
 			continue
 		}
 		matches := 0
-		for _, kw := range h.Keywords {
-			kw = strings.ToLower(strings.TrimSpace(kw))
-			if strings.Contains(search, kw) {
+		for _, scene := range h.Scenes {
+			kw := strings.ToLower(strings.TrimSpace(scene))
+			if strings.Contains(argStr, kw) || strings.Contains(tl, kw) {
 				matches++
 			}
 		}
-		score := matches * 100 / len(h.Keywords)
+		score := matches * 100 / len(h.Scenes)
 		if score > bestScore {
 			bestScore = score
 			best = h
 		}
 	}
-	return best, bestScore
+
+	if bestScore > 0 {
+		return best, bestScore
+	}
+	return nil, 0
 }
 
-// checkHabitCounter increments and returns count for a 50-80% match.
-func checkHabitCounter(habitID int) int {
-	habitCounterMu.Lock()
-	defer habitCounterMu.Unlock()
 
-	now := time.Now()
-	e, ok := habitCounter[habitID]
+var (
+	habitCounters = make(map[int]*rateEntry)
+	habitMu       sync.Mutex
+	habitIDSeq    int
+)
+
+func nextHabitID() int {
+	habitMu.Lock()
+	defer habitMu.Unlock()
+	habitIDSeq++
+	return habitIDSeq
+}
+
+func incrementHabitCount(id int) {
+	habitMu.Lock()
+	defer habitMu.Unlock()
+	e, ok := habitCounters[id]
 	if !ok {
-		habitCounter[habitID] = &rateEntry{count: 1, firstSeen: now}
-		return 1
+		habitCounters[id] = &rateEntry{count: 1, firstSeen: time.Now()}
+		return
 	}
-	if now.Sub(e.firstSeen) > 5*time.Minute {
+	if time.Since(e.firstSeen) > 5*time.Minute {
 		e.count = 1
-		e.firstSeen = now
-		return 1
+		e.firstSeen = time.Now()
+		return
 	}
 	e.count++
+}
+
+func checkHabitCounter(id int) int {
+	habitMu.Lock()
+	defer habitMu.Unlock()
+	e, ok := habitCounters[id]
+	if !ok {
+		return 0
+	}
+	if time.Since(e.firstSeen) > 5*time.Minute {
+		e.count = 0
+		return 0
+	}
 	return e.count
 }
 
-func flattenArgs(args map[string]any) string {
-	var parts []string
-	for k, v := range args {
-		parts = append(parts, k)
-		if s, ok := v.(string); ok {
-			parts = append(parts, s)
-		}
-	}
-	return strings.Join(parts, " ")
-}
 
-// updateHabitThreshold adjusts habit threshold based on outcome.
-func updateHabitThreshold(habitID int, delta int) {
-	habitMu.Lock()
-	defer habitMu.Unlock()
-	for _, h := range habitLibrary {
-		if h.ID == habitID {
-			h.Threshold += delta
-			if h.Threshold < 10 {
-				h.Threshold = 10
-			}
-			if h.Threshold > 90 {
-				h.Threshold = 90
-			}
-			break
-		}
-	}
-}
-
-// incrementHabitCount adds 1 to habit frequency.
-func incrementHabitCount(habitID int) {
-	habitMu.Lock()
-	defer habitMu.Unlock()
-	for _, h := range habitLibrary {
-		if h.ID == habitID {
-			h.Count++
-			break
-		}
-	}
-}
