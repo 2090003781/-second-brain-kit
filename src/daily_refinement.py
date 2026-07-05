@@ -148,92 +148,125 @@ def scan_topics(cfg, ref_date):
 
 
 def generate_report(cfg, ref_date, results):
-    """Generate a structured daily summary — not a log dump."""
+    """Human-readable daily summary: topics, projects, todos, counts."""
     report_dir = cfg["daily_dir"]
     report_dir.mkdir(parents=True, exist_ok=True)
     report_file = report_dir / f"{ref_date}.md"
 
-    # Read existing extra entries (written by writer.go)
-    existing_extra = []
-    # (keeping the merge logic from v2)
-
-    lines = [f"# {ref_date} 日报\n\n"]
-
     decisions = results.get("DECISION", [])
     errors = results.get("ERROR", [])
-    preferences = results.get("PREFERENCE", [])
-    pending = results.get("PENDING", [])
-    triggers = results.get("TRIGGER", [])
+    prefs = results.get("PREFERENCE", [])
+    pends = results.get("PENDING", [])
 
-    total = sum(len(v) for v in results.values())
+    lines = []
 
-    # Section 1: Summary of what happened today
-    lines.append("## 今日概览\n")
-    if total == 0 and not existing_extra:
-        lines.append("无记录\n")
-    else:
-        item_count = sum(len(v) for v in results.values())
-        lines.append(f"- 总事件: {item_count} 条\n")
+    # ── Header: date range ──
+    lines.append(f"# {ref_date} 日报\n")
+    # Try to extract time range from reasonix-raw
+    raw_dir = cfg["vault"] / "reasonix-raw" / ref_date
+    time_range = ""
+    if raw_dir.exists():
+        times = []
+        for f in sorted(raw_dir.glob("*.md")):
+            for line in f.read_text("utf-8", errors="replace").split("\n"):
+                m = _re.match(r"(\d{2}:\d{2}) \|", line)
+                if m:
+                    times.append(m.group(1))
+        if len(times) >= 2:
+            time_range = f" ({times[0]} \u2192 {times[-1]})"
+    lines[0] = lines[0].rstrip("\n") + time_range + "\n\n"
 
-    # Section 2: Key decisions (精简，不要原始日志)
-    if decisions:
-        lines.append("\n## 关键决策\n")
-        for e in decisions[:10]:
-            s = (e["groups"][0] or "").strip() if e["groups"] else ""
-            context = (e["groups"][1] or "").strip() if len(e["groups"]) > 1 else ""
-            if s:
-                line = f"1. {s[:80]}"
-                if context:
-                    line += f" — {context[:60]}"
-                lines.append(line + "\n")
+    # ── Section 1: Topics discussed ──
+    lines.append("## \u4eca\u65e5\u8bdd\u9898\n")
+    topics_found = set()
+    if raw_dir.exists():
+        for f in sorted(raw_dir.glob("*.md")):
+            topic = f.stem
+            if topic != ref_date and not topic.startswith("会话-"):
+                topics_found.add(topic)
+    for t in sorted(topics_found):
+        lines.append(f"- \u5173\u4e8e{t}\n")
+    if not topics_found:
+        lines.append(f"\uff08\u672a\u8bb0\u5f55\u4e3b\u9898\uff09\n")
+    lines.append("\n")
 
-    # Section 3: Errors that occurred
-    if errors:
-        lines.append("\n## 错误/异常\n")
-        for e in errors[:10]:
-            s = (e["groups"][0] or "").strip() if e["groups"] else ""
-            resolution = (e["groups"][1] or "").strip() if len(e["groups"]) > 1 else ""
-            if s:
-                lines.append(f"- {s[:80]}: {resolution[:60]}\n")
-
-    # Section 4: Preferences captured
-    if preferences:
-        lines.append("\n## 偏好变化\n")
-        for e in preferences[:5]:
-            s = (e["groups"][0] or "").strip() if e["groups"] else ""
-            if s:
-                lines.append(f"- {s[:100]}\n")
-
-    # Section 5: Active topics from snapshot
-    snap_path = cfg["vault"] / "系统设计" / "状态快照.md"
+    # ── Section 2: Project status ──
+    lines.append("## \u9879\u76ee\u72b6\u6001\n")
+    # Read state snapshot for progress info
+    snap_path = cfg["vault"] / "\u7cfb\u7edf\u8bbe\u8ba1" / "\u72b6\u6001\u5feb\u7167.md"
+    has_projects = False
     if snap_path.exists():
         try:
-            text = snap_path.read_text("utf-8")
-            if text.find("## 当前话题") > 0:
-                in_topic = False
-                topic_items = []
-                for line in text.split("\n"):
-                    if "## 当前话题" in line or "## 已完成的" in line or "## 进行中" in line:
-                        in_topic = True
-                        continue
-                    if line.startswith("## ") and in_topic:
-                        in_topic = False
-                    if in_topic and line.strip().startswith("- "):
-                        topic_items.append(line.strip()[2:])
-                if topic_items:
-                    lines.append("\n## 活跃话题\n")
-                    for t in topic_items[:8]:
-                        lines.append(f"- {t}\n")
-        except: pass
+            snap_text = snap_path.read_text("utf-8")
+            # Extract sections: \u5df2\u5b8c\u6210\u7684 / \u8fdb\u884c\u4e2d / \u4e0b\u4e00\u6b65
+            done, doing, next_step = [], [], []
+            current = ""
+            for line in snap_text.split("\n"):
+                if "\u5df2\u5b8c\u6210" in line: current = "done"
+                elif "\u8fdb\u884c\u4e2d" in line: current = "doing"
+                elif "\u4e0b\u4e00\u6b65" in line: current = "next"
+                elif line.startswith("## ") and current:
+                    current = ""
+                elif current and line.strip().startswith("- "):
+                    item = line.strip()[2:]
+                    if current == "done": done.append(item)
+                    elif current == "doing": doing.append(item)
+                    elif current == "next": next_step.append(item)
+            if doing or done:
+                has_projects = True
+            for d in doing:
+                lines.append(f"### {d}\n")
+                lines.append("- \u72b6\u6001: \u8fdb\u884c\u4e2d\n")
+                lines.append("\n")
+            for d in done:
+                lines.append(f"### {d}\n")
+                lines.append("- \u72b6\u6001: \u5b8c\u6210\n")
+                lines.append("\n")
+            if next_step:
+                lines.append("**\u4e0b\u4e00\u6b65\uff1a**\n")
+                for n in next_step:
+                    lines.append(f"- {n}\n")
+                lines.append("\n")
+        except:
+            pass
+    if not has_projects and not topics_found:
+        lines.append(f"\uff08\u65e0\u6d3b\u8dc3\u9879\u76ee\uff09\n")
 
-    # Append extra from writer.go (deduplicated)
-    if existing_extra:
-        lines.append("\n## 其他记录\n")
-        for extra in existing_extra[:5]:
-            lines.append(f"{extra}\n")
+    # ── Section 3: Todo list ──
+    lines.append("## \u5f85\u529e\n")
+    todo_path = cfg["vault"] / "\u7cfb\u7edf\u8bbe\u8ba1" / "\u5f85\u529e\u6e05\u5355.md"
+    todo_link = f"[[系统设计/待办清单.md]]"
+    lines.append(f"- \u5f85\u529e\u6e05\u5355: {todo_link}\n")
+    
+    # Check today's decisions for completion signals
+    for d in decisions:
+        s = d["groups"][0][:60] if d["groups"] and d["groups"][0] else ""
+        if s and any(w in s for w in ["完成", "修复", "解决", "部署", "推送", "实现"]):
+            lines.append(f"- \u2714 {s}\n")
+    lines.append("\n")
+
+    # ── Section 4: Summary ──
+    lines.append("## \u603b\u7ed3\n")
+    has_content = False
+    if decisions:
+        lines.append(f"- \u51b3\u7b56: {len(decisions)} \u6761\n"); has_content = True
+    if errors:
+        # Filter unique errors
+        err_summaries = set()
+        for e in errors:
+            s = e["groups"][0][:50] if e["groups"] and e["groups"][0] else ""
+            if s:
+                err_summaries.add(s)
+        lines.append(f"- \u9519\u8bef/\u5f02\u5e38: {len(err_summaries)} \u6761\n"); has_content = True
+    if prefs:
+        lines.append(f"- \u504f\u597d\u53d8\u5316: {len(prefs)} \u6761\n"); has_content = True
+    if not has_content:
+        lines.append(f"\uff08\u65e0\u8bb0\u5f55\uff09\n")
+    lines.append("\n")
 
     report_file.write_text("".join(lines), "utf-8")
     return report_file
+
 
 def update_libraries(cfg, results, dry_run=False):
     """Update error library and habit library from extracted markers."""
@@ -391,7 +424,7 @@ def main():
     for k, v in results.items():
         print(f"  {k}: {len(v)}")
 
-    if not args.dry_run and total > 0:
+    if not args.dry_run:  # always generate, even with 0 markers
         report = generate_report(cfg, ref_date, results)
         print(f"[daily] Report: {report}")
 
