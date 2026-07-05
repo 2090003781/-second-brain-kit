@@ -784,6 +784,27 @@ func handleUserPrompt(prompt string, conn net.Conn) {
 		conn.Write([]byte(`{"violated":false}`))
 		return
 	}
+
+	// Check for resume keywords (接续/继续 + topic)
+	if strings.Contains(prompt, "接续") || strings.Contains(prompt, "继续") {
+		hotFile := filepath.Join(vaultPath, "记忆", "热缓存.md")
+		hotData, err := os.ReadFile(hotFile)
+		if err == nil && len(hotData) > 50 {
+			raw := string(hotData)
+			if strings.HasPrefix(raw, "---") {
+				if end := strings.Index(raw[3:], "---"); end > 0 {
+					raw = raw[3+end+3:]
+				}
+			}
+			msg := fmt.Sprintf("## 接续热缓存\n\n%s", raw[:min(800, len(raw))])
+			resp, _ := json.Marshal(&violation{Violated: false, SystemMessage: msg})
+			conn.Write(resp)
+			writeLog("hot-cache: injected on resume request")
+			return
+		}
+	}
+
+	// Normal knowledge search
 	results := searchKnowledge(prompt, 3)
 	if len(results) == 0 {
 		conn.Write([]byte(`{"violated":false}`))
@@ -1190,19 +1211,6 @@ func main() {
 	loadHabitLibrary(vaultPath)
 	loadSupervisorRules(vaultPath)
 	loadBotState()
-
-	// Lifecycle monitor
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			running := isReasonixRunning()
-			botOpen := isBotWindowOpen()
-			if !running && !botOpen {
-				writeLog("no reasonix.exe and no bot window, shutting down")
-				os.Exit(0)
-			}
-		}
-	}()
 
 	// Start writer (port 49520) and bot sync
 	go startWriter(writerPort)
