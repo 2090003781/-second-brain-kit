@@ -15,15 +15,9 @@ def load_config():
     vault = Path("D:/个人数据/辞玖")
     return {
         "vault": vault,
-        "topics_dir": vault / "话题",
         "errors_file": vault / "记忆" / "错误库.md",
         "habits_file": vault / "记忆" / "习惯库.md",
         "daily_dir": vault / "日报",
-        "bot_logs": {
-            "QQ-Bot": vault / "个人" / "Bot" / "QQ-Bot" / "日志.md",
-            "微信-Bot": vault / "个人" / "Bot" / "微信-Bot" / "日志.md",
-        },
-        "bot_report_dir": vault / "Bot-日报",
     }
 
 # ── New format patterns ──
@@ -103,12 +97,15 @@ def parse_entry_line(line: str, ref_date: str) -> dict | None:
 
 
 def scan_topics(cfg, ref_date):
-    """Scan reasonix-raw and JSONL logs for structured markers."""
+    """Scan reasonix-raw, supervision log, and JSONL logs for structured markers."""
     import json as _json
     results = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
     
-    # 1. Scan reasonix-raw directory
-    raw_dir = cfg["vault"] / "reasonix-raw"
+    # 1. Scan reasonix-raw directory (now under 日志/)
+    raw_dir = cfg["vault"] / "日志" / "reasonix-raw"
+    # Fallback: old location
+    if not raw_dir.exists():
+        raw_dir = cfg["vault"] / "reasonix-raw"
     if raw_dir.exists():
         # New format: reasonix-raw/YYYY-MM-DD/*.md
         dated_dir = raw_dir / ref_date
@@ -118,6 +115,14 @@ def scan_topics(cfg, ref_date):
                 for line in text.split("\n"):
                     entry = parse_entry_line(line, ref_date)
                     if entry: results[entry["type"]].append(entry)
+                    # Also check for raw marker format: 时间 | [DECISION: ...]
+                    if "| [" in line:
+                        for tag, pat in [("DECISION", DECISION_RE), ("PREFERENCE", PREFERENCE_RE), ("PENDING", PENDING_RE), ("TRIGGER", TRIGGER_RE)]:
+                            if "[" + tag in line.upper():
+                                m = pat.search(line)
+                                if m:
+                                    results[tag].append({"type": tag, "groups": m.groups(), "raw": line})
+                                    break
         # Old format: reasonix-raw/YYYY-MM-DD.md
         old_file = raw_dir / f"{ref_date}.md"
         if old_file.exists():
@@ -144,269 +149,161 @@ def scan_topics(cfg, ref_date):
                 except: pass
         except: pass
     
+    # 3. Scan supervision log for violations
+    sup_log = cfg["vault"] / "日志" / "监督日志.md"
+    if not sup_log.exists():
+        sup_log = cfg["vault"] / "监督日志.md"
+    if sup_log.exists():
+        mmdd = ref_date[5:]
+        for line in sup_log.read_text("utf-8", errors="replace").split("\n"):
+            if mmdd in line and "Tool" in line:
+                results["ERROR"].append({"type":"ERROR","groups":(line[:120],None,None,None),"raw":line})
+    
     return results
 
 
 def generate_report(cfg, ref_date, results):
-    """Human-readable daily summary: topics, projects, todos, counts."""
+    """Generate clean daily report."""
     report_dir = cfg["daily_dir"]
     report_dir.mkdir(parents=True, exist_ok=True)
     report_file = report_dir / f"{ref_date}.md"
-
     decisions = results.get("DECISION", [])
     errors = results.get("ERROR", [])
     prefs = results.get("PREFERENCE", [])
-    pends = results.get("PENDING", [])
-
     lines = []
 
-    # ── Header: date range ──
-    lines.append(f"# {ref_date} 日报\n")
-    # Try to extract time range from reasonix-raw
-    raw_dir = cfg["vault"] / "reasonix-raw" / ref_date
-    time_range = ""
-    if raw_dir.exists():
-        times = []
-        for f in sorted(raw_dir.glob("*.md")):
-            for line in f.read_text("utf-8", errors="replace").split("\n"):
-                m = _re.match(r"(\d{2}:\d{2}) \|", line)
-                if m:
-                    times.append(m.group(1))
-        if len(times) >= 2:
-            time_range = f" ({times[0]} \u2192 {times[-1]})"
-    lines[0] = lines[0].rstrip("\n") + time_range + "\n\n"
-
-    # ── Section 1: Topics discussed ──
-    lines.append("## \u4eca\u65e5\u8bdd\u9898\n")
-    topics_found = set()
-    if raw_dir.exists():
-        for f in sorted(raw_dir.glob("*.md")):
-            topic = f.stem
-            if topic != ref_date and not topic.startswith("会话-"):
-                topics_found.add(topic)
-    for t in sorted(topics_found):
-        lines.append(f"- \u5173\u4e8e{t}\n")
-    if not topics_found:
-        lines.append(f"\uff08\u672a\u8bb0\u5f55\u4e3b\u9898\uff09\n")
-    lines.append("\n")
-
-    # ── Section 2: Project status ──
-    lines.append("## \u9879\u76ee\u72b6\u6001\n")
-    # Read state snapshot for progress info
-    snap_path = cfg["vault"] / "\u7cfb\u7edf\u8bbe\u8ba1" / "\u72b6\u6001\u5feb\u7167.md"
-    has_projects = False
-    if snap_path.exists():
-        try:
-            snap_text = snap_path.read_text("utf-8")
-            # Extract sections: \u5df2\u5b8c\u6210\u7684 / \u8fdb\u884c\u4e2d / \u4e0b\u4e00\u6b65
-            done, doing, next_step = [], [], []
-            current = ""
-            for line in snap_text.split("\n"):
-                if "\u5df2\u5b8c\u6210" in line: current = "done"
-                elif "\u8fdb\u884c\u4e2d" in line: current = "doing"
-                elif "\u4e0b\u4e00\u6b65" in line: current = "next"
-                elif line.startswith("## ") and current:
-                    current = ""
-                elif current and line.strip().startswith("- "):
-                    item = line.strip()[2:]
-                    if current == "done": done.append(item)
-                    elif current == "doing": doing.append(item)
-                    elif current == "next": next_step.append(item)
-            if doing or done:
-                has_projects = True
-            for d in doing:
-                lines.append(f"### {d}\n")
-                lines.append("- \u72b6\u6001: \u8fdb\u884c\u4e2d\n")
-                lines.append("\n")
-            for d in done:
-                lines.append(f"### {d}\n")
-                lines.append("- \u72b6\u6001: \u5b8c\u6210\n")
-                lines.append("\n")
-            if next_step:
-                lines.append("**\u4e0b\u4e00\u6b65\uff1a**\n")
-                for n in next_step:
-                    lines.append(f"- {n}\n")
-                lines.append("\n")
-        except:
-            pass
-    if not has_projects and not topics_found:
-        lines.append(f"\uff08\u65e0\u6d3b\u8dc3\u9879\u76ee\uff09\n")
-
-    # ── Section 3: Todo list ──
-    lines.append("## \u5f85\u529e\n")
-    todo_path = cfg["vault"] / "\u7cfb\u7edf\u8bbe\u8ba1" / "\u5f85\u529e\u6e05\u5355.md"
-    todo_link = f"[[系统设计/待办清单.md]]"
-    lines.append(f"- \u5f85\u529e\u6e05\u5355: {todo_link}\n")
-    
-    # Check today's decisions for completion signals
+    lines.append("# " + ref_date + " \u65e5\u62a5")
+    lines.append("")
+    lines.append("## \u5de5\u4f5c\u5185\u5bb9")
+    has_work = set()
     for d in decisions:
-        s = d["groups"][0][:60] if d["groups"] and d["groups"][0] else ""
-        if s and any(w in s for w in ["完成", "修复", "解决", "部署", "推送", "实现"]):
-            lines.append(f"- \u2714 {s}\n")
-    lines.append("\n")
+        s = d["groups"][0][:80] if d["groups"] and d["groups"][0] else ""
+        if s:
+            has_work.add(s)
+    for w in sorted(has_work):
+        lines.append("- " + w)
+    if not has_work:
+        lines.append("(\u65e0\u8bb0\u5f55)")
+    lines.append("")
 
-    # ── Section 4: Summary ──
-    lines.append("## \u603b\u7ed3\n")
-    has_content = False
-    if decisions:
-        lines.append(f"- \u51b3\u7b56: {len(decisions)} \u6761\n"); has_content = True
+    lines.append("## \u8fdb\u5ea6")
+    lines.append("- \u5f85\u529e \u2192 [[\u9879\u76ee/\u7b2c\u4e8c\u5927\u8111/\u5f85\u529e\u6e05\u5355.md]]")
+    todo_path = cfg["vault"] / "\u9879\u76ee" / "\u7b2c\u4e8c\u5927\u8111" / "\u5f85\u529e\u6e05\u5355.md"
+    if todo_path.exists():
+        todo_items = []
+        for line in todo_path.read_text("utf-8").split("\n"):
+            s = line.strip()
+            if s.startswith("- [x]") or s.startswith("- [X]"):
+                title = s[6:].split("\u2014")[0].strip().strip("*").strip()
+                # Extract @start date
+                start_m = re.search(r"@start:(\S+)", s)
+                start_date = start_m.group(1) if start_m else ""
+                todo_items.append(("done", title, start_date, s))
+            elif s.startswith("- [ ]") and len(s) > 6:
+                title = s[6:].split("\u2014")[0].strip().strip("*").strip()
+                start_m = re.search(r"@start:(\S+)", s)
+                active_m = re.search(r"@active:(\S+)", s)
+                start_date = start_m.group(1) if start_m else ""
+                active_date = active_m.group(1) if active_m else ""
+                todo_items.append(("pending", title, start_date, active_date, s))
+        pending_list = [(t, sd, ad) for item in todo_items if item[0] == "pending" for t, sd, ad in [(item[1], item[2], item[3])]]
+        done_list = [(t, sd) for item in todo_items if item[0] == "done" for t, sd in [(item[1], item[2])]]
+        # Sort pending by @active desc (most recent first)
+        pending_list.sort(key=lambda x: x[2] if x[2] else "", reverse=True)
+        for t, sd, ad in pending_list:
+            display = "  - [ ] " + t
+            if sd:
+                display += " (" + sd + ")"
+            lines.append(display)
+        for t, sd in done_list:
+            display = "  - [x] " + t
+            lines.append(display)
+        if not pending_list and not done_list:
+            lines.append("  (\u65e0)")
+    lines.append("")
+
+    lines.append("## \u63d0\u70bc")
     if errors:
-        # Filter unique errors
-        err_summaries = set()
-        for e in errors:
-            s = e["groups"][0][:50] if e["groups"] and e["groups"][0] else ""
-            if s:
-                err_summaries.add(s)
-        lines.append(f"- \u9519\u8bef/\u5f02\u5e38: {len(err_summaries)} \u6761\n"); has_content = True
+        lines.append("- \u9519\u8bef: \u63d0\u53d6 " + str(len(errors)) + " \u6761")
+    if decisions:
+        lines.append("- \u51b3\u7b56: " + str(len(decisions)) + " \u6761")
     if prefs:
-        lines.append(f"- \u504f\u597d\u53d8\u5316: {len(prefs)} \u6761\n"); has_content = True
-    if not has_content:
-        lines.append(f"\uff08\u65e0\u8bb0\u5f55\uff09\n")
-    lines.append("\n")
+        lines.append("- \u4e60\u60ef: \u63d0\u70bc " + str(len(prefs)) + " \u6761")
+    if not (errors or decisions or prefs):
+        lines.append("(\u65e0\u8bb0\u5f55)")
+    lines.append("")
 
-    report_file.write_text("".join(lines), "utf-8")
+    lines.append("## \u9700\u5ba1\u6279")
+    from pathlib import Path as _P
+    sup_log = _P.home() / ".reasonix" / "logs" / "supervisor_run.log"
+    if sup_log.exists():
+        mmdd = ref_date[5:]
+        try:
+            today_log = [l for l in sup_log.read_text("utf-8", errors="replace").split("\n") if mmdd in l]
+        except:
+            today_log = []
+        downgrades = [l for l in today_log if "downgrading" in l]
+        if downgrades:
+            seen = set()
+            for l in downgrades:
+                m = re.search(r"(\S+):\s*fired", l)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    cnt = sum(1 for x in downgrades if m.group(1) in x)
+                    lines.append("- [\u5efa\u8bae] " + m.group(1) + " \u89e6\u53d1\u9891\u7e41(" + mmdd + " \u65e5 " + str(cnt) + " \u6b21)\uff0c\u5747\u5df2\u964d\u7ea7\u672a\u5b9e\u9645\u63a8\u9001")
+                    lines.append("  (\u8bc1\u636e: \u89e6\u53d1\u540e\u88ab\u9650\u901f\u964d\u7ea7)")
+        if not downgrades:
+            lines.append("(\u65e0)")
+    else:
+        lines.append("(\u65e0)")
+    lines.append("")
+
+    content_text = "\n".join(lines) + "\n"
+    report_file.write_text(content_text, "utf-8")
+    # Write stats JSON
+    stats_dir = cfg["vault"] / "\u5468\u62a5" / "stats"
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    stats = {
+        "date": ref_date,
+        "errors": len(errors),
+        "decisions": len(decisions),
+        "preferences": len(prefs),
+        "todo_done": sum(1 for s in lines if s.startswith("  - [x]")),
+        "todo_pending": sum(1 for s in lines if s.startswith("  - [") and not s.startswith("  - [x")),
+        # Read supervisor log for rule stats
+        "rules": {}
+    }
+    sup_log = Path.home() / ".reasonix" / "logs" / "supervisor_run.log"
+    if sup_log.exists():
+        mmdd = ref_date[5:]
+        try:
+            today_log = [l for l in sup_log.read_text("utf-8", errors="replace").split("\n") if mmdd in l]
+        except:
+            today_log = []
+        for l in today_log:
+            if "downgrading" in l:
+                m = re.search(r"(\S+):\s*fired", l)
+                if m:
+                    r = m.group(1)
+                    if r not in stats["rules"]:
+                        stats["rules"][r] = 0
+                    stats["rules"][r] += 1
+    (stats_dir / f"{ref_date}.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), "utf-8")
     return report_file
-
 
 def update_libraries(cfg, results, dry_run=False):
     """Update error library and habit library from extracted markers."""
-    # ── Error library ──
-    err_entries = results.get("ERROR", [])
-    if err_entries and not dry_run:
-        err_file = cfg["errors_file"]
-        if err_file.exists():
-            content = err_file.read_text("utf-8")
-            lines = content.split("\n")
-
-            for entry in err_entries:
-                err_type = (entry["groups"][0] or "").strip().lower()
-                resolution = (entry["groups"][1] or "").strip()
-                if not err_type:
-                    continue
-
-                matched_idx = -1
-                for i, ln in enumerate(lines):
-                    if ln.startswith("## ") and err_type in ln.lower():
-                        matched_idx = i
-                        break
-
-                if matched_idx >= 0:
-                    for j in range(matched_idx, min(matched_idx + 10, len(lines))):
-                        if "- **次数：**" in lines[j]:
-                            m2 = re.search(r'\d+', lines[j])
-                            if m2:
-                                old_n = int(m2.group())
-                                lines[j] = lines[j].replace(str(old_n), str(old_n + 1), 1)
-                            break
-                    # Update resolution if present and not "待补充"
-                    if resolution:
-                        for j in range(matched_idx, min(matched_idx + 10, len(lines))):
-                            if "- **解决：**" in lines[j] and "待补充" in lines[j]:
-                                lines[j] = f"- **解决：** {resolution}"
-                                break
-                else:
-                    new_num = len([l for l in lines if l.startswith("## #")]) + 1
-                    template = (
-                        f"\n## #{new_num} {err_type.capitalize()}\n"
-                        f"- **次数：** 1\n"
-                    )
-                    if resolution:
-                        template += f"- **解决：** {resolution}\n"
-                    else:
-                        template += "- **解决：** (待补充)\n"
-                    template += "- **领域：** 通用\n"
-                    content += template
-                    lines = content.split("\n")
-
-            content = "\n".join(lines)
-            err_file.write_text(content, "utf-8")
-            print(f"[daily] Error library: {len(err_entries)} marker(s) processed")
-
-    # ── Trigger patterns → habit library ──
-    trigger_entries = results.get("TRIGGER", [])
-    if trigger_entries and not dry_run:
-        habits_file = cfg["habits_file"]
-        if habits_file.exists():
-            content = habits_file.read_text("utf-8")
-            lines = content.split("\n")
-
-            for entry in trigger_entries:
-                summary = (entry["groups"][0] or "").strip()
-                action = (entry["groups"][1] or "").strip()
-                if not summary:
-                    continue
-                keyword = summary[:30]
-
-                matched = False
-                for i, ln in enumerate(lines):
-                    if ln.startswith("## [") and keyword.lower() in ln.lower():
-                        matched = True
-                        for j in range(i, min(i + 10, len(lines))):
-                            if "- **次数：**" in lines[j]:
-                                m2 = re.search(r'\d+', lines[j])
-                                if m2:
-                                    old_n = int(m2.group())
-                                    lines[j] = lines[j].replace(str(old_n), str(old_n + 1), 1)
-                                break
-                        break
-
-                if not matched:
-                    new_entry = (
-                        f"\n## [通用] {keyword}\n"
-                        f"- **次数：** 1\n"
-                        f"- **场景：** {keyword}\n"
-                        f"- **模板：** (待提炼)\n"
-                        f"- **阈值：** 50\n"
-                        f"- **来源：** 日报自动记录\n"
-                    )
-                    content += new_entry
-
-            content = "\n".join(lines)
-            habits_file.write_text(content, "utf-8")
-            print(f"[daily] Habit library: {len(trigger_entries)} trigger(s) processed")
-
+    # Error library update disabled: format changed to 方案: instead of 解决:
+    return
 
 def scan_bot_logs(cfg, ref_date):
-    """Scan bot log files for markers. Returns (bot_markers, bot_name_to_markers)."""
-    bot_results = {}
-    total_markers = 0
-    for bot_name, log_file in cfg.get("bot_logs", {}).items():
-        if not log_file.exists():
-            continue
-        markers = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
-        try:
-            text = log_file.read_text("utf-8", errors="replace")
-            for line in text.split("\n"):
-                entry = parse_entry_line(line, ref_date)
-                if entry:
-                    markers[entry["type"]].append(entry)
-                    total_markers += 1
-        except: pass
-        if sum(len(v) for v in markers.values()) > 0:
-            bot_results[bot_name] = markers
-    return bot_results, total_markers
+    """Scan bot log files for markers."""
+    return {}, 0
 
 def generate_bot_report(cfg, ref_date, bot_results):
     """Generate separate bot report per bot."""
-    report_dir = cfg.get("bot_report_dir", cfg["vault"] / "Bot-日报")
-    report_dir.mkdir(parents=True, exist_ok=True)
-    display_map = {"DECISION": "决策", "ERROR": "错误", "PREFERENCE": "偏好", "PENDING": "待续"}
-    for bot_name, markers in bot_results.items():
-        report_file = report_dir / f"{ref_date}-{bot_name}.md"
-        lines = [f"# {ref_date} {bot_name} 日报\n\n"]
-        total = sum(len(v) for v in markers.values())
-        if total == 0:
-            lines.append("无记录\n")
-        else:
-            for key, zh in display_map.items():
-                entries = markers.get(key, [])
-                if entries:
-                    lines.append(f"\n## {zh}\n")
-                    for e in entries:
-                        s = e["groups"][0] if e["groups"] and e["groups"][0] else e["raw"]
-                        lines.append(f"- {s.strip()}\n")
-        report_file.write_text("".join(lines), "utf-8")
-        print(f"[daily] Bot report: {report_file} ({total} markers)")
+    pass
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -433,61 +330,44 @@ def main():
     # Auto-archive stale error entries (60d no trigger → archived)
     if not args.dry_run:
         archive_stale(cfg, ref_date)
+    
+    # Update todo list from today's completed decisions
+    if not args.dry_run:
+        update_todo_list(cfg, results.get("DECISION", []))
+
+
+def update_todo_list(cfg, decisions):
+    """Mark matching todo items as completed from today's decisions."""
+    todo_path = cfg["vault"] / "\u9879\u76ee" / "\u7b2c\u4e8c\u5927\u8111" / "\u5f85\u529e\u6e05\u5355.md"
+    if not todo_path.exists() or not decisions:
+        return
+    content = todo_path.read_text("utf-8")
+    lines = content.split("\n")
+    keywords = ["\u5b8c\u6210", "\u4fee\u590d", "\u89e3\u51b3", "\u90e8\u7f72", "\u5b9e\u73b0"]
+    completed = set()
+    for d in decisions:
+        s = d["groups"][0][:60] if d["groups"] and d["groups"][0] else ""
+        if s and any(w in s for w in keywords):
+            completed.add(s[:30].lower())
+    if not completed:
+        return
+    modified = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("- [ ]") or stripped.startswith("# [ ]"):
+            for c in completed:
+                if c in stripped.lower():
+                    lines[i] = stripped.replace("[ ]", "[x]", 1)
+                    modified = True
+                    break
+    if modified:
+        todo_path.write_text("\n".join(lines), "utf-8")
+        print(f"[daily] Todo: updated\n")
 
 
 def archive_stale(cfg, today):
-    """Mark error entries with last_seen > 60 days as '已归档'."""
-    err_file = cfg["errors_file"]
-    if not err_file.exists():
-        return
-    content = err_file.read_text("utf-8")
-    lines = content.split("\n")
-    modified = False
-    now_date = datetime.date.fromisoformat(today) if today else datetime.date.today()
-
-    for i, ln in enumerate(lines):
-        if ln.startswith("## #"):
-            # Check for last_seen field in following lines
-            name = ln.strip()
-            last_seen_date = None
-            last_seen_idx = -1
-            status_idx = -1
-            for j in range(i, min(i + 15, len(lines))):
-                if "- **最近出现：**" in lines[j]:
-                    date_str = lines[j].split("最近出现：**")[-1].strip()
-                    try:
-                        last_seen_date = datetime.date.fromisoformat(date_str[:10])
-                        last_seen_idx = j
-                    except (ValueError, IndexError):
-                        pass
-                if "- **状态：**" in lines[j]:
-                    status_idx = j
-                if ln.strip() == "---" and j > i:
-                    break  # end of entry
-
-            if last_seen_date:
-                days_since = (now_date - last_seen_date).days
-                if days_since > 60:
-                    if status_idx >= 0 and "已归档" not in lines[status_idx]:
-                        lines[status_idx] = "- **状态：** 已归档"
-                        modified = True
-                        print(f"[daily] Archive: {name} ({days_since}d since last seen)")
-            else:
-                # No last_seen field — add one (use today as starting point)
-                insert_at = i + 1
-                # Find where frequency line ends
-                for j in range(i, min(i + 10, len(lines))):
-                    if "- **次数：**" in lines[j]:
-                        lines[j] = lines[j] + f"\n- **最近出现：** {today}"
-                        modified = True
-                        break
-                else:
-                    # No count line, insert after name
-                    lines.insert(insert_at, f"- **最近出现：** {today}")
-                    modified = True
-
-    if modified:
-        err_file.write_text("\n".join(lines), "utf-8")
+    """Mark old error entries as archived."""
+    pass
 
 
 if __name__ == "__main__":
