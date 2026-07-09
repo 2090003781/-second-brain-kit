@@ -10,7 +10,22 @@ Usage:
 import datetime, json, re, sys
 from pathlib import Path
 
-VAULT = Path("D:/个人数据/辞玖")
+def _get_vault():
+    env_path = os.environ.get("OBSIDIAN_VAULT")
+    if env_path:
+        return Path(env_path)
+    script_dir = Path(__file__).resolve().parent.parent
+    for cfg in [script_dir / "config.toml", Path.home() / ".second-brain" / "config.toml"]:
+        if cfg.exists():
+            cp = configparser.ConfigParser()
+            cp.read(str(cfg))
+            try:
+                return Path(cp.get("vault", "path"))
+            except:
+                pass
+    return Path("D:/个人数据/辞玖")
+
+VAULT = _get_vault()
 DAILY_DIR = VAULT / "日报"
 WEEKLY_DIR = VAULT / "周报"
 

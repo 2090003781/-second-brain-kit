@@ -8,11 +8,27 @@ Usage:
     python src/daily_refinement.py --dry-run
 """
 
-import argparse, datetime, json, re, sys
+import argparse, configparser, datetime, json, os, re, sys
 from pathlib import Path
 
+def get_vault_path():
+    """Read vault path from config.toml, env var, or fallback."""
+    env_path = os.environ.get("OBSIDIAN_VAULT")
+    if env_path:
+        return Path(env_path)
+    script_dir = Path(__file__).resolve().parent.parent
+    for cfg in [script_dir / "config.toml", Path.home() / ".second-brain" / "config.toml"]:
+        if cfg.exists():
+            cp = configparser.ConfigParser()
+            cp.read(str(cfg))
+            try:
+                return Path(cp.get("vault", "path"))
+            except:
+                pass
+    return Path("D:/个人数据/辞玖")
+
 def load_config():
-    vault = Path("D:/个人数据/辞玖")
+    vault = get_vault_path()
     return {
         "vault": vault,
         "errors_file": vault / "记忆" / "错误库.md",
