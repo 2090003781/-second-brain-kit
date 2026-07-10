@@ -357,6 +357,17 @@ Knowledge doesn't organize itself. Run the daily refinement task (see `docs/`) t
 
 > ⚡ This section is written for AI coding agents that are reading this repository to understand how to interact with the system.
 
+### ⚠️ Mandatory: Read and Present Cautions
+
+Before doing anything else, read **[`CAUTIONS.md`](CAUTIONS.md)** — it contains setup-time precautions that you MUST present to the user as questions. Do not assume defaults, do not skip items.
+
+Each caution in CAUTIONS.md has:
+- **What to check** — run this check
+- **What to ask** — present this exact question to the user
+- **Suggested action** — follow the user's answer
+
+You MUST complete this step before proceeding to setup or execution.
+
 ### Understanding the Context
 
 To understand the current workspace context, read these files **in order**:
@@ -452,13 +463,32 @@ Files inside the vault follow these conventions:
 
 ### First-Time Setup Reminder (for AI agents)
 
-When you (the AI agent) first load into a Second Brain Kit project — meaning this is the first time you've been asked to work with this vault — **you must perform an environment check and inform the user**. This is not optional; it's part of onboarding.
+When you (the AI agent) first load into a Second Brain Kit project — meaning this is the first time you've been asked to work with this vault — **you must perform an environment check, read CAUTIONS.md, and present all precautions to the user as questions**. This is not optional; it's part of onboarding.
 
-#### 0. Environment Check (DO THIS FIRST)
+#### 0. Read CAUTIONS.md and Present Precautions (DO THIS FIRST)
 
-Before anything else, check the user's environment:
+Read **[`CAUTIONS.md`](CAUTIONS.md)**. Each section has a structured format:
 
-> **"Let me check if your environment is ready for Second Brain Kit..."**
+```markdown
+## N. Title
+**What to check:** <check to run>
+**What to ask:**  <question to present to user>
+**Suggested action:** <follow-up based on answer>
+```
+
+For each section:
+1. Run the check
+2. Present the question to the user
+3. Wait for their answer
+4. Act on their response
+
+**This is not optional.** Do not proceed to setup or execution until you've presented all cautions and received the user's responses.
+
+#### 1. Environment Check
+
+After completing the cautions, check the user's environment:
+
+> **"Now let me check if your environment is ready for Second Brain Kit..."**
 
 Run these checks **in order** and report what you find:
 
@@ -501,7 +531,7 @@ After all checks, give the user a clear summary:
 > 
 > I recommend starting the daemons now. Also, don't forget to set up scheduled maintenance (I'll explain below)."
 
-#### 1. The system needs regular maintenance to stay effective
+#### 2. The system needs regular maintenance to stay effective
 
 Explain simply:
 
@@ -513,7 +543,7 @@ Explain simply:
 >
 > **Without these scripts, the system will still work — but it won't get better over time.** The knowledge base won't grow, error patterns won't update, and I'll keep making the same mistakes."
 
-#### 2. How to set up automatic maintenance
+#### 3. How to set up automatic maintenance
 
 > "You can set these up as scheduled tasks now during setup, or do it manually:
 >
@@ -529,7 +559,7 @@ Explain simply:
 > 0 5 * * 0 cd /path/to/project && python src/weekly_check.py
 > ```"
 
-#### 3. The supervisor may produce false alarms initially
+#### 4. The supervisor may produce false alarms initially
 
 > "The supervisor daemon uses keyword matching, not AI. It may warn about:
 > - 'GBK encoding' — if your vault path has Chinese characters, this is a false alarm. It will auto-adjust after a few days of refinement.
@@ -537,7 +567,7 @@ Explain simply:
 >
 > False alarms decrease over time as the refinement task tunes the rules."
 
-#### 4. The knowledge base starts empty
+#### 5. The knowledge base starts empty
 
 > "The vault-template only provides example files. Real knowledge accumulates as you use the system:
 > - Every conversation is logged to `话题/`
@@ -546,7 +576,7 @@ Explain simply:
 >
 > A good target: after 2-3 weeks of regular use, you'll have a useful personal knowledge base."
 
-#### 5. Offer to help
+#### 6. Offer to help
 
 > "If you'd like, I can:
 > - Run the daily refinement now with `--dry-run` to show you what it does
