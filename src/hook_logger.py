@@ -1,15 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Reasonix Hook Logger v4.1 — Relay mode + JSONL fallback
-=========================================================
-Reads JSON payload from stdin, forwards to obsidian_writer daemon (TCP :49520).
-On connection failure, falls back to JSONL logging.
-
-Also forwards PreToolUse events to supervisor (TCP :49522) and emits any
-violation systemMessage to stdout.
-
-Usage (piped from hook system):
-    echo '{"event":"UserPromptSubmit","prompt":"hello"}' | python hook_logger.py
+Reasonix Hook Logger v4.1 — 转发器模式 + JSONL 降级
+=====================================================
+从 stdin 读取 JSON payload，尝试转发给 obsidian_writer 守护进程 (TCP :49520)，
+连接失败时自动降级到 JSONL 写入（保持原有逻辑）。
 """
 
 import json
@@ -19,33 +13,22 @@ import hashlib
 import socket
 from pathlib import Path
 
-from config import load_config, vault_path, logs_dir, session_file as _session_file
+LOGS_DIR = Path.home() / ".reasonix" / "logs" / "sessions" / "raw"
+SESSION_FILE = Path.home() / ".reasonix" / "logs" / ".current_session"
+VAULT_PATH = Path(r"D:\个人数据\辞玖")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-cfg = load_config()
-LOGS_DIR = logs_dir()
-SESSION_FILE = _session_file()
-VAULT_PATH = vault_path()
-
-# Daemon forward config
+# ── 守护进程转发配置 ──
 OBSIDIAN_WRITER_HOST = "127.0.0.1"
-OBSIDIAN_WRITER_PORT = cfg.get("writer", {}).get("port", 49520)
+OBSIDIAN_WRITER_PORT = 49520
 SUPERVISOR_HOST = "127.0.0.1"
-SUPERVISOR_PORT = cfg.get("supervisor", {}).get("port", 49522)
+SUPERVISOR_PORT = 49522
 
-# Key event types for .kw file
+# .kw 文件的关键事件类型
 _KW_TYPES = {"decision", "error", "milestone", "progress", "blocker", "resume", "write", "filecreate", "test"}
-_SESSION_END = "SessionEnd"
-
-_TOPIC_MARKER_PATTERN = (
-    r'[─\-—]{2,}\s*话题分隔\s*[:：]\s*(.+?)\s*[─\-—]{2,}'
-)
 
 
-def read_session_id() -> str | None:
-    """Read the current session ID from session file."""
+
+def read_session_id():
     if SESSION_FILE.exists():
         try:
             data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
@@ -55,8 +38,7 @@ def read_session_id() -> str | None:
     return None
 
 
-def new_session_id() -> str:
-    """Generate a new session ID and persist it."""
+def new_session_id():
     now = datetime.datetime.now()
     suffix = hashlib.md5(str(now.timestamp()).encode()).hexdigest()[:8]
     session_id = f"reasonix-{now.strftime('%Y%m%d%H%M%S')}-{suffix}"
@@ -68,7 +50,6 @@ def new_session_id() -> str:
 
 
 def clear_session():
-    """Remove the session file."""
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
 
@@ -83,7 +64,6 @@ def truncate(text, max_len=500):
 
 
 def write_kw_entry(session_id, prefix, text):
-    """Append a key-work entry to the .kw file for this session."""
     if not session_id or not text:
         return
     kw_path = LOGS_DIR / f"{session_id}.kw"
@@ -96,7 +76,7 @@ def write_kw_entry(session_id, prefix, text):
 
 
 def write_log_entry(session_id, log_entry):
-    """Write one JSONL entry; also write .kw for key events."""
+    """写入 .jsonl 日志，同时为关键事件写 .kw（降级/后备路径）"""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOGS_DIR / f"{session_id}.jsonl"
     try:
@@ -111,6 +91,7 @@ def write_log_entry(session_id, log_entry):
     event = log_entry.get("event", "")
 
     if event == "SessionStart":
+        # Context injection now handled by supervisor
         write_kw_entry(session_id, "first", content.replace("会话开始", "").strip().strip("()").strip())
     elif event == "SessionEnd":
         write_kw_entry(session_id, "session_end", content)
@@ -123,12 +104,10 @@ def write_log_entry(session_id, log_entry):
         write_kw_entry(session_id, level, content)
 
 
-# ---------------------------------------------------------------------------
-# TCP forwarding
-# ---------------------------------------------------------------------------
+# ── TCP 转发 ──────────────────────────────────────────────────
 
 def forward_to_daemon(payload: dict) -> bool:
-    """Forward payload to obsidian_writer daemon; return True on success."""
+    """将 payload 转发给 obsidian_writer 守护进程，成功返回 True"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(1.0)
@@ -141,17 +120,16 @@ def forward_to_daemon(payload: dict) -> bool:
     except (ConnectionRefusedError, OSError, socket.timeout):
         return False
 
-
 def forward_to_supervisor(payload: dict) -> dict | None:
     """
-    Forward payload to supervisor (request-response mode).
+    将 payload 转发给 supervisor（请求-响应模式）。
 
-    For PreToolUse events, read the JSON response:
-      - {"violated": False} → pass
-      - {"violated": True, "systemMessage": "..."} → violation
+    对 PreToolUse 事件，读取 supervisor 的 JSON 响应：
+      - {"violated": False} → 通过
+      - {"violated": True, "systemMessage": "..."} → 违规，返回完整响应
 
-    For other events, fire-and-forget.
-    Returns None on connection failure.
+    对其他事件，fire-and-forget。
+    返回 None 表示连接失败。
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -175,10 +153,7 @@ def forward_to_supervisor(payload: dict) -> dict | None:
     except json.JSONDecodeError:
         return {"violated": False}
 
-
-# ---------------------------------------------------------------------------
-# Error detection
-# ---------------------------------------------------------------------------
+# ── 错误检测 ──────────────────────────────────────────────────
 
 _REAL_ERROR_PREFIXES = (
     "error:", "error ", "exception:", "exception ",
@@ -206,12 +181,9 @@ def looks_like_real_error(text):
     return False
 
 
-# ---------------------------------------------------------------------------
-# Event formatting
-# ---------------------------------------------------------------------------
+# ── 事件格式化（同 v4） ──────────────────────────────────────
 
 def format_content(event, payload):
-    """Build the log fields for a given event."""
     tool_name = payload.get("toolName", "")
     tool_args = payload.get("toolArgs", {})
     tool_result = payload.get("toolResult", "")
@@ -224,15 +196,16 @@ def format_content(event, payload):
     session_id = ""
 
     if event == "SessionStart":
+        # Context injection now handled by supervisor
         clear_session()
         session_id = new_session_id()
-        content = f"Session start (cwd: {payload.get('cwd', '')})"
+        content = f"会话开始 (工作目录: {payload.get('cwd', '')})"
         log_type = "resume"
         _auto_compress()
 
     elif event == "SessionEnd":
         session_id = read_session_id()
-        content = "Session end"
+        content = "会话结束"
         log_type = "summary"
         clear_session()
 
@@ -245,35 +218,35 @@ def format_content(event, payload):
     elif event == "PreToolUse":
         session_id = read_session_id()
         args_str = truncate(json.dumps(tool_args, ensure_ascii=False), 300)
-        content = f"Tool call {tool_name} | Args: {args_str}"
+        content = f"调用工具 {tool_name} | 参数: {args_str}"
         log_type = "action"
 
     elif event == "PostToolUse":
         session_id = read_session_id()
         result_str = str(tool_result) if tool_result else ""
         if result_str and len(result_str) < 200:
-            content = f"Tool {tool_name} → {result_str}"
+            content = f"工具 {tool_name} → {result_str}"
         elif result_str:
             preview = truncate(result_str, 200)
-            content = f"Tool {tool_name} → {preview}"
+            content = f"工具 {tool_name} → {preview}"
         else:
-            content = f"Tool {tool_name} executed"
+            content = f"工具 {tool_name} 执行完毕"
         is_real_error = looks_like_real_error(result_str)
         log_type = "error" if is_real_error else "action"
 
     elif event == "UserPromptSubmit":
         session_id = read_session_id()
-        content = f"User prompt: {truncate(prompt, 300)}"
+        content = f"用户提问: {truncate(prompt, 300)}"
         log_type = "decision"
 
     elif event == "Stop":
         session_id = read_session_id()
-        content = f"Turn {payload.get('turn', 0)} complete"
+        content = f"Turn {payload.get('turn', 0)} 完成"
         log_type = "summary"
 
     elif event == "Notification":
         session_id = read_session_id()
-        content = f"Notification: {truncate(msg, 200)}"
+        content = f"通知: {truncate(msg, 200)}"
         log_type = "action"
 
     elif event == "PostLLMCall":
@@ -281,29 +254,29 @@ def format_content(event, payload):
         reply = payload.get("toolResult", "") or payload.get("message", "")
         if reply:
             reply_preview = truncate(str(reply).replace(chr(10), " "), 200)
-            content = f"Model output (turn {payload.get('turn', 0)}): {reply_preview}"
+            content = f"模型输出 (turn {payload.get('turn', 0)}): {reply_preview}"
         else:
-            content = f"Model output (turn {payload.get('turn', 0)})"
+            content = f"模型输出 (turn {payload.get('turn', 0)})"
         log_type = "action"
 
     elif event == "PreCompact":
         session_id = read_session_id()
-        content = f"Session compress ({payload.get('trigger', 'auto')})"
+        content = f"会话压缩 ({payload.get('trigger', 'auto')})"
         log_type = "summary"
 
     elif event == "SubagentStop":
         session_id = read_session_id()
-        content = "Sub-task done"
+        content = "子任务完成"
         log_type = "summary"
 
     elif event == "PermissionRequest":
         session_id = read_session_id()
-        content = f"Permission request: {truncate(tool_name, 100)}"
+        content = f"权限请求: {truncate(tool_name, 100)}"
         log_type = "action"
 
     else:
         session_id = read_session_id()
-        content = f"Event {event}"
+        content = f"事件 {event}"
         log_type = "action"
 
     if not session_id:
@@ -313,9 +286,8 @@ def format_content(event, payload):
 
 
 def _auto_compress():
-    """Trigger log compression if the helper script exists."""
     try:
-        script = logs_dir() / "compress_logs.py"
+        script = Path.home() / ".reasonix" / "logs" / "compress_logs.py"
         if script.exists():
             import subprocess
             subprocess.run(
@@ -326,41 +298,42 @@ def _auto_compress():
         pass
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+# ── 主入口 ────────────────────────────────────────────────────
+
 
 def main():
     try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
         if hasattr(sys.stdin, 'reconfigure'):
             sys.stdin.reconfigure(encoding='utf-8')
         raw = sys.stdin.read()
         if not raw.strip():
             return
         payload = json.loads(raw)
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         return
 
     event = payload.get("event", "")
     if not event:
         return
 
-    # Forward all events to obsidian_writer
+    # 转发到 obsidian_writer（全部事件）
     forward_to_daemon(payload.copy())
 
-    # PreToolUse → supervisor (request-response, may return violation)
-    if event == "PreToolUse":
+    # PreToolUse/UserPromptSubmit → supervisor（请求-响应，可返回 systemMessage）
+    if event in ("PreToolUse", "UserPromptSubmit"):
         sv_resp = forward_to_supervisor(payload.copy())
-        if sv_resp and sv_resp.get("violated"):
+        if sv_resp:
             sv_msg = sv_resp.get("systemMessage", "")
             if sv_msg:
-                # Emit systemMessage to stdout → hook system injects into AI context
+                # emit systemMessage to stdout → hook系统自动注入下一回合AI上下文
                 print(sv_msg, flush=True)
-    # Other events → supervisor (fire-and-forget)
+    # 其他事件 → supervisor（fire-and-forget）
     elif event:
         forward_to_supervisor(payload.copy())
 
-    # Fallback: write JSONL as backup
+    # 降级：写 JSONL 作为备份
     level, log_type, content, session_id = format_content(event, payload)
     log_entry = {
         "ts": datetime.datetime.now().isoformat(),
@@ -373,5 +346,47 @@ def main():
     write_log_entry(session_id, log_entry)
 
 
+_supervisor_started = False
+
+def ensure_supervisor():
+    """Start supervisor if not running. Checks port first to avoid duplicates."""
+    import socket, subprocess, time
+    # Check if already running
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", 49522))
+        s.close()
+        return True
+    except:
+        pass  # not running, start below
+    
+    sup_path = str(Path.home() / ".reasonix" / "bin" / "supervisor.exe")
+    if not Path(sup_path).exists():
+        return False
+    try:
+        subprocess.Popen([sup_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(5):
+            time.sleep(0.5)
+            try:
+                s2 = socket.socket(); s2.settimeout(0.5)
+                s2.connect(("127.0.0.1", 49522))
+                s2.close()
+                return True
+            except: pass
+        return False
+    except:
+        return False
+
 if __name__ == "__main__":
+    ensure_supervisor()
     main()
+
+
+
+
+
+
+
+
+
