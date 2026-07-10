@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 """Build knowledge index from Vault — v2: better content extraction."""
 
-import json, os, re
+import json, os, re, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -29,7 +29,6 @@ def extract_frontmatter(text):
 
 def extract_heading(text):
     clean = strip_bom(text)
-    # Skip frontmatter
     start = 0
     if clean.startswith("---"):
         end = clean.find("---", 3)
@@ -49,15 +48,12 @@ def extract_heading(text):
 
 def extract_tags(fm, text):
     tags = []
-    # Obsidian frontmatter: tags: [tag1, tag2] or tags: tag1
     if "tags" in fm:
         raw = fm["tags"].strip()
-        # Remove brackets, split by comma
         raw = raw.strip("[]")
         tags.extend(t.strip().strip("\"' ") for t in raw.split(",") if t.strip())
-    # Also check for inline #tags in content
     clean = strip_bom(text)
-    for m in re.finditer(r'#([\w\u4e00-\u9fff]+)', clean[:500]):
+    for m in re.finditer(r"#([\w\u4e00-\u9fff]+)", clean[:500]):
         t = m.group(1)
         if t not in tags and len(t) > 1:
             tags.append(t)
@@ -67,18 +63,15 @@ def extract_tags(fm, text):
 def extract_summary(text):
     """Extract meaningful content, skipping frontmatter and metadata lines."""
     clean = strip_bom(text)
-    # Skip frontmatter
     start = 0
     if clean.startswith("---"):
         end = clean.find("---", 3)
         if end > 0:
             start = end + 3
-
     body = clean[start:].strip()
     lines = []
     for line in body.split("\n"):
         line = line.strip()
-        # Skip headings, quotes, metadata, empty
         if line.startswith("#"):
             continue
         if line.startswith(">"):
@@ -90,31 +83,26 @@ def extract_summary(text):
         lines.append(line)
         if len(" ".join(lines)) > 150:
             break
-
     summary = " ".join(lines)[:150].strip()
-    # Clean markdown artifacts
-    summary = re.sub(r'\[\[([^\]]+)\]\]', r'\1', summary)
-    summary = re.sub(r'[*_`#]', '', summary)
+    summary = re.sub(r"\[\[([^\]]+)\]\]", r"\1", summary)
+    summary = re.sub(r"[*_`#]", "", summary)
     return summary if summary else "(无摘要)"
 
 
 def build_index():
     if not KB_DIR.exists():
         return
-
     entries = {}
     for md_file in sorted(KB_DIR.rglob("*.md")):
         try:
             text = md_file.read_text("utf-8", errors="replace")
         except Exception:
             continue
-
         fm = extract_frontmatter(text)
         title = extract_heading(text) or md_file.stem
         tags = extract_tags(fm, text)
         summary = extract_summary(text)
         rel_path = str(md_file.relative_to(VAULT))
-
         entries[md_file.stem] = {
             "title": title,
             "summary": summary,
@@ -122,7 +110,6 @@ def build_index():
             "path": rel_path,
             "project": fm.get("project", "全局"),
         }
-
     INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
     INDEX_PATH.write_text(
         json.dumps({"updated": datetime.now().isoformat(), "entries": entries},
@@ -138,14 +125,12 @@ def search(query, top_k=5):
         return []
     data = json.loads(INDEX_PATH.read_text("utf-8"))
     entries = data.get("entries", {})
-
     q_words = query.lower().split()
     scored = []
     for key, e in entries.items():
         title_lower = e["title"].lower()
         summary_lower = e.get("summary", "").lower()
         tags_lower = [t.lower() for t in e.get("tags", [])]
-
         score = 0
         for w in q_words:
             if w in title_lower:
@@ -158,7 +143,6 @@ def search(query, top_k=5):
         if score > 0:
             e["_score"] = score
             scored.append(e)
-
     scored.sort(key=lambda x: x["_score"], reverse=True)
     return scored[:top_k]
 
@@ -170,25 +154,40 @@ def context_inject(prompt="", top_k=3, min_score=5):
     """
     results = search(prompt, top_k=top_k)
     results = [r for r in results if r.get("_score", 0) >= min_score]
-
     if not results:
         return "", 0
-
     lines = ["## 相关知识与经验"]
     for r in results:
         s = r.get("summary", "")[:100]
         t = r.get("title", "?")
         lines.append(f"- [{t}]: {s}")
-
     return "\n".join(lines), len(results)
 
 
-if __name__ == "__main__":
-    build_index()
-    # Quick test
-    for q in ["python 编码", "bot 微信", "obsidian 记忆", "supervisor 监督"]:
-        ctx, n = context_inject(q, top_k=3, min_score=3)
-        if ctx:
-            print(f"\n🔍 \"{q}\" ({n} matches, ~{len(ctx)//4} tokens):")
-            print(ctx[:200])
+def stable_core():
+    """Return the stable knowledge overview (~1KB, rarely changes)."""
+    idx_path = Path.home() / ".reasonix" / "knowledge" / "INDEX.md"
+    if idx_path.exists():
+        return idx_path.read_text("utf-8")
+    return "# 全局知识库\n> 索引文件未找到，请先建立知识库。\n"
 
+
+if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) >= 2 and _sys.argv[1] == "build":
+        build_index()
+    elif len(_sys.argv) >= 3 and _sys.argv[1] in ("search", "context_inject"):
+        query = _sys.argv[2]
+        top_k = int(_sys.argv[3]) if len(_sys.argv) >= 4 else 3
+        min_score = int(_sys.argv[4]) if len(_sys.argv) >= 5 else 5
+        ctx, n = context_inject(query, top_k=top_k, min_score=min_score)
+        print(ctx if ctx else "")
+    elif len(_sys.argv) >= 2 and _sys.argv[1] == "stable":
+        print(stable_core())
+    else:
+        build_index()
+        for q in ["python 编码", "bot 微信", "obsidian 记忆", "supervisor 监督"]:
+            ctx, n = context_inject(q, top_k=3, min_score=3)
+            if ctx:
+                print(f"\n🔍 {q} ({n} matches, ~{len(ctx)//4} tokens):")
+                print(ctx[:200])
