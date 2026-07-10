@@ -146,7 +146,7 @@ def scan_topics(cfg, ref_date):
                 entry = parse_entry_line(line, ref_date)
                 if entry: results[entry["type"]].append(entry)
     
-    # 2. Scan JSONL logs for markers in content
+    # 2. Scan JSONL logs for markers in all message content
     logs_dir = Path.home() / ".reasonix" / "logs" / "sessions" / "raw"
     date_prefix = ref_date.replace("-", "")
     for f in sorted(logs_dir.glob(f"reasonix-{date_prefix}*.jsonl")):
@@ -156,12 +156,21 @@ def scan_topics(cfg, ref_date):
                 try:
                     entry = _json.loads(line)
                     content = entry.get("content", "")
-                    for marker_type in ["decision","error"]:
-                        if entry.get("type") == marker_type and len(content) > 10:
-                            if marker_type == "decision" and ("[DECISION" in content or "决策" in content):
-                                results["DECISION"].append({"type":"DECISION","groups":(content[:120],None,None),"raw":content})
-                            elif marker_type == "error" and ("[ERROR" in content or "error:" in content.lower()):
-                                results["ERROR"].append({"type":"ERROR","groups":(content[:120],None,None,None),"raw":content})
+                    if not content or len(content) < 10:
+                        continue
+                    for tag, pat, marker in [("DECISION", DECISION_RE, "[DECISION"), ("ERROR", ERROR_RE, "[ERROR"), ("PREFERENCE", PREFERENCE_RE, "[PREFERENCE")]:
+                        if marker in content:
+                            m = pat.search(content)
+                            if m:
+                                g = m.groups()
+                                # Validate: not empty, not start with / or %, at least 2 chars
+                                if g[0] and len(g[0]) >= 2 and not g[0].startswith("/") and "%" not in g[0]:
+                                    results[tag].append({"type": tag, "groups": g, "raw": content[:200]})
+                                    break
+                    if "决策" in content:
+                        m = LEGACY_DECISION.search(content)
+                        if m:
+                            results["DECISION"].append({"type": "DECISION", "groups": (m.group(1), None, None), "raw": content[:200]})
                 except: pass
         except: pass
     
