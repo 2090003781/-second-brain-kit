@@ -114,7 +114,7 @@ bash setup.sh
 
 1. **启动守护进程：**
    ```bash
-   python src/obsidian_writer.py   # 监听 TCP :49520
+   python src/daily_refinement.py   # 监听 TCP :49520
    go build -o supervisor.exe src/supervisor-go/ && supervisor.exe      # 监听 TCP :49522
    ```
 2. **配置你的 AI agent** 将 hook 事件发送给守护进程（详见 `docs/` 中的协议文档）。
@@ -127,7 +127,7 @@ second-brain-kit/
 ├── config.toml.example      # 配置模板
 ├── src/
 │   ├── config.py            # 配置加载器
-│   ├── obsidian_writer.py   # 写入 Markdown 到 vault（TCP :49520）
+│   ├── daily_refinement.py   # 写入 Markdown 到 vault（TCP :49520）
 │   ├── hook_logger.py       # stdin 转发 + JSONL 降级（神经）
 │   ├── daily_refinement.py  # v2: 结构化日志提炼 + 自动归档
 │   ├── knowledge_indexer.py # v2: 知识库索引生成 + 检索
@@ -149,7 +149,7 @@ second-brain-kit/
 ## 工作原理
 
 ```
-AI Agent  ──stdin──>  hook_logger.py(神经) ──TCP──>  obsidian_writer.py ──>  Obsidian Vault(大脑)
+AI Agent  ──stdin──>  hook_logger.py(神经) ──TCP──>  daily_refinement.py ──>  Obsidian Vault(大脑)
                             │
                             └──TCP──>  supervisor.exe(小脑) ──>  监督规则 + 上下文注入 + 知识检索
                                            │
@@ -273,7 +273,7 @@ The setup script will ask for your Obsidian vault path, copy the vault template,
 
 1. **Start the daemons:**
    ```bash
-   python src/obsidian_writer.py   # listens on TCP :49520
+   python src/daily_refinement.py   # listens on TCP :49520
    go build -o supervisor.exe src/supervisor-go/ && supervisor.exe      # listens on TCP :49522
    ```
 2. **Configure your AI agent** to send hook events to the daemons (see the protocol documentation in `docs/`).
@@ -286,8 +286,8 @@ second-brain-kit/
 ├── config.toml.example      # Template configuration
 ├── src/
 │   ├── config.py            # Shared config loader
-│   ├── obsidian_writer.py   # Writes Markdown to vault (TCP :49520)
-│   ├── supervisor.py        # Rule-checking interceptor (TCP :49522)
+│   ├── daily_refinement.py   # Writes Markdown to vault (TCP :49520)
+│   ├── supervisor-go/supervisor.exe        # Rule-checking interceptor (TCP :49522)
 │   └── hook_logger.py       # Stdin relay to daemons + JSONL fallback
 ├── vault-template/          # Seed content for your Obsidian vault
 │   ├── 记忆/                 # Memory files (rules + error patterns)
@@ -309,16 +309,16 @@ second-brain-kit/
 ### How it Works
 
 ```
-AI Agent  ──stdin──>  hook_logger.py  ──TCP──>  obsidian_writer.py  ──>  Obsidian Vault
+AI Agent  ──stdin──>  hook_logger.py  ──TCP──>  daily_refinement.py  ──>  Obsidian Vault
                             │
-                            └──TCP──>  supervisor.py  ──>  "规则.md" / "高频错误.md"
+                            └──TCP──>  supervisor-go/supervisor.exe  ──>  "规则.md" / "高频错误.md"
                                            │
                                            └── violation message ──stdout──> AI Agent (next turn)
 ```
 
 1. The AI agent emits JSON hook events to `stdout` (piped into `hook_logger.py`).
-2. `hook_logger.py` forwards all events to `obsidian_writer.py`, which appends them to Markdown files in the vault.
-3. For `PreToolUse` events, `hook_logger.py` also asks `supervisor.py` to check the proposed action against your memory rules.
+2. `hook_logger.py` forwards all events to `daily_refinement.py`, which appends them to Markdown files in the vault.
+3. For `PreToolUse` events, `hook_logger.py` also asks `supervisor-go/supervisor.exe` to check the proposed action against your memory rules.
 4. If a violation is detected, a `systemMessage` is emitted — the AI agent's runtime injects it into the next LLM turn.
 
 ---
@@ -375,8 +375,8 @@ To understand the current workspace context, read these files **in order**:
 1. **`README.md`** (this file) — project overview and interaction protocol.
 2. **`config.toml.example`** — config schema and available settings.
 3. **`src/config.py`** — config loader implementation; defines defaults and fallback logic.
-4. **`src/obsidian_writer.py`** — the writer daemon that receives events.
-5. **`src/supervisor.py`** — the rule-checking daemon; read this to understand what rules are enforced.
+4. **`src/daily_refinement.py`** — the writer daemon that receives events.
+5. **`src/supervisor-go/supervisor.exe`** — the rule-checking daemon; read this to understand what rules are enforced.
 6. **`src/hook_logger.py`** — the stdin relay that glues everything together.
 7. **`vault-template/记忆/全局/规则.md`** — the loaded rules that the supervisor checks against.
 8. **`vault-template/记忆/全局/高频错误.md`** — the loaded error patterns.
@@ -519,7 +519,7 @@ If fails: "Missing Python dependency 'portalocker'. Run: `pip install portalocke
 python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49520)); s.close(); print('writer OK')" 2>&1
 python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49522)); s.close(); print('supervisor OK')" 2>&1
 ```
-If missing: "Daemons not running. Start them with: `python src/obsidian_writer.py` and `python src/supervisor.py`"
+If missing: "Daemons not running. Start them with: `python src/daily_refinement.py` and `python src/supervisor-go/supervisor.exe`"
 
 **Step 5 — Report summary**
 After all checks, give the user a clear summary:
@@ -527,7 +527,7 @@ After all checks, give the user a clear summary:
 > - Obsidian: ✅ found
 > - Vault path: ✅ valid
 > - Dependencies: ✅ installed
-> - Daemons: ⚠️ not running (start with `python src/obsidian_writer.py`)
+> - Daemons: ⚠️ not running (start with `python src/daily_refinement.py`)
 > 
 > I recommend starting the daemons now. Also, don't forget to set up scheduled maintenance (I'll explain below)."
 
