@@ -184,7 +184,95 @@ def scan_topics(cfg, ref_date):
             if mmdd in line and "Tool" in line:
                 results["ERROR"].append({"type":"ERROR","groups":(line[:120],None,None,None),"raw":line})
     
+
     return results
+
+
+def scan_failed_cases(cfg, ref_date):
+    """Scan reasonix-raw for failures using ripgrep."""
+    import subprocess
+    raw_dir = cfg["vault"] / "日志" / "reasonix-raw"
+    if not raw_dir.exists():
+        raw_dir = cfg["vault"] / "reasonix-raw"
+    dated_dir = raw_dir / ref_date
+    if not dated_dir.exists():
+        return []
+    result = subprocess.run(
+        ["rg", "--no-heading", "-n", "@status:failed", str(dated_dir)],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return []
+    cases = []
+    seen = set()
+    for line in result.stdout.split("\n"):
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        parts = line.split("|")
+        ts = parts[0].split(":")[-1].strip() if ":" in parts[0] else parts[0].strip()
+        detail = "|".join(parts[1:3]) if len(parts) > 2 else parts[1] if len(parts) > 1 else ""
+        detail = detail.strip()[:100]
+        loss_kw = ["损失", "回滚", "误删", "丢失", "崩溃", "中断", "回退", "修复", "异常", "失败", "耽误", "浪费"]
+        reason = ""
+        if "@status:failed" in line:
+            if "[ERROR" in line:
+                reason = "用户报错"
+            elif "[DECISION" in line and any(kw in line for kw in loss_kw):
+                reason = "纠正措施"
+            else:
+                reason = "工具失败"
+        if reason:
+            key = detail[:60]
+            if key not in seen:
+                seen.add(key)
+                cases.append({"ts": ts, "detail": f"[{reason}] {detail}", "raw": line[:150]})
+    return cases
+
+
+def append_cases_to_errors(cfg, ref_date, cases):
+    """Match failed cases to error library entries and append as cases."""
+    import os
+    err_file = cfg["vault"] / "记忆" / "错误库.md"
+    if not err_file.exists() or not cases:
+        return
+    content = err_file.read_text("utf-8")
+    lines = content.split("\n")
+    matched = False
+    for case in cases:
+        dl = case["detail"].lower()
+        best_i = -1
+        best_s = 0
+        cur = ""
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s.startswith("## #"):
+                cur = s[4:].strip()
+            elif s.startswith("- **关键词：") and cur:
+                kw_part = s.split("：")[-1] if "：" in s else s
+                sc = sum(1 for kw in kw_part.split(",") if kw.strip().strip("*").strip().lower() in dl)
+                if sc > best_s:
+                    best_s = sc
+                    best_i = i
+        if best_i >= 0 and best_s >= 1:
+            cl = f"  - {ref_date[5:]} | {case['detail'][:80]}"
+            # Check not duplicate
+            dup = False
+            for j in range(best_i, min(best_i + 30, len(lines))):
+                if ref_date[5:] in lines[j] and case["detail"][:30] in lines[j]:
+                    dup = True
+                    break
+            if not dup:
+                # Insert after the best match line (under its entry)
+                # Find insertion point: after - **关键词： line or end of entry
+                insert_at = best_i + 1
+                while insert_at < len(lines) and not lines[insert_at].strip().startswith("## #"):
+                    insert_at += 1
+                lines.insert(insert_at - 1, cl)
+                matched = True
+    if matched:
+        err_file.write_text("\n".join(lines), "utf-8")
+        print(f"[daily] Error library: cases appended")
 
 
 def generate_report(cfg, ref_date, results):
@@ -349,6 +437,12 @@ def main():
     if not args.dry_run:  # always generate, even with 0 markers
         report = generate_report(cfg, ref_date, results)
         print(f"[daily] Report: {report}")
+
+        # Scan failed cases and append to error library
+        cases = scan_failed_cases(cfg, ref_date)
+        if cases:
+            append_cases_to_errors(cfg, ref_date, cases)
+            print(f"[daily] Cases: {len(cases)} failed ops scanned")
 
     update_libraries(cfg, results, args.dry_run)
 

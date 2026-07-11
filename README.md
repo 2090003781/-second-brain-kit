@@ -156,7 +156,7 @@ AI Agent  ──stdin──>  hook_logger.py(神经) ──TCP──>  obsidian_
                                            └── systemMessage ──stdout──> AI Agent（下回合）
 ```
 
-**v2.0 三层架构：大脑(Vault) / 小脑(supervisor) / 神经(hook_logger)**
+**v2.3 三层架构：大脑(Vault) / 小脑(supervisor) / 神经(hook_logger)**
 
 1. **神经 (hook_logger.py)** — 纯传输层，只做事件转发和日志降级，不做决策。
 2. **小脑 (supervisor.exe, Go)** — 智能决策层。SessionStart 自动注入上下文包（规则+错误+习惯+进度），UserPrompt 检索相关知识，PreToolUse 检查监督规则。
@@ -164,11 +164,11 @@ AI Agent  ──stdin──>  hook_logger.py(神经) ──TCP──>  obsidian_
 
 ---
 
-## v2.0 新增功能 / What's New
+## v2.3 新增功能 / What's New
 
 ### Agent 激活模式（实验性）
 
-v2.0 支持"激活性记忆"模式：Agent 启动时只加载一份紧凑的 `AGENTS.md`（~1.5KB），包含 Vault 地图 + 系统能力概述。所有具体知识（规则、错误、习惯、经验）存放在 Obsidian Vault 中，Agent 按需读取或由小脑在 SessionStart 自动推送。
+v2.3 支持"激活性记忆"模式：Agent 启动时只加载一份紧凑的 `AGENTS.md`（~1.5KB），包含 Vault 地图 + 系统能力概述。所有具体知识（规则、错误、习惯、经验）存放在 Obsidian Vault 中，Agent 按需读取或由小脑在 SessionStart 自动推送。
 
 **与全部记忆加载的区别：**
 
@@ -258,7 +258,7 @@ git clone https://github.com/your-org/second-brain-kit.git
 cd second-brain-kit
 
 # 2. Install dependencies
-pip install portalocker  # (tomllib is built-in on Python 3.11+)
+pip install -r requirements.txt
 
 # 3. Run the setup script
 # On Windows:
