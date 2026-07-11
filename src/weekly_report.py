@@ -182,6 +182,14 @@ def generate_weekly_report(monday, sunday, week_str):
         lines.append("|------|:----:|")
         for rule, stats in sorted(rule_stats.items(), key=lambda x: -x[1]["fired"]):
             lines.append(f"| {rule} | {stats['fired']} |")
+        # Auto-tune
+        bad = [(r, s) for r, s in rule_stats.items() if s["fired"] >= 3 and s["effective"] == 0]
+        if bad:
+            lines.append("")
+            lines.append("\u8c03\u6574\u5efa\u8bae")
+            for r, s in sorted(bad, key=lambda x: -x[1]["fired"]):
+                lines.append("- [\u5efa\u8bae] " + r + " \u89e6\u53d1" + str(s["fired"]) + "\u6b21\u4f46\u6548\u7387\u4e3a0\uff0c\u5efa\u8bae\u964d\u7ea7")
+            lines.append("(\u4f60\u5ba1\u6279\u540e\u81ea\u52a8\u6267\u884c)")
     else:
         lines.append("(\u65e0\u89e6\u53d1)")
     lines.append("")
@@ -233,7 +241,7 @@ def generate_weekly_report(monday, sunday, week_str):
             except:
                 pass
     lines.append(f"- \u65b0\u589e: {total_new} \u6761")
-    lines.append("- \u5df2\u5ba1\u6838\u94fe\u63a5: (\u5f85\u5ba1\u6838)")
+    lines.append("- \u5df2\u5ba1\u6838\u94fe\u63a5: \u672a\u542f\u7528\u81ea\u52a8\u5ba1\u6838")
     lines.append("")
     
     # 6. Next week plan
@@ -265,6 +273,46 @@ def main():
     monday, sunday = get_week_range(week_str)
     report = generate_weekly_report(monday, sunday, week_str)
     print(f"[weekly] Report: {report}")
+
+    # Archive old supervision log entries
+    if VAULT:
+        archive_supervision_log(str(VAULT))
+
+
+def archive_supervision_log(vault_path):
+    """Archive supervision log entries older than 30 days."""
+    sup_log = Path(vault_path) / "\u65e5\u5fd7" / "\u76d1\u7763\u65e5\u5fd7.md"
+    if not sup_log.exists():
+        return
+    lines = sup_log.read_text("utf-8", errors="replace").split("\n")
+    if len(lines) < 100:
+        return  # Not enough data to archive
+    cutoff = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%m-%d")
+    kept = []
+    archived = []
+    for line in lines:
+        if any(kw in line for kw in ["[", "-", "#", ""]):
+            pass
+    # Simple heuristic: archive lines with date stamps older than cutoff
+    import re
+    for line in lines:
+        if re.search(r"\b\d{2}-\d{2}\b", line[:10]):
+            date_match = re.search(r"(\d{2}-\d{2})", line)
+            if date_match and date_match.group(1) < cutoff:
+                archived.append(line)
+            else:
+                kept.append(line)
+        else:
+            kept.append(line)
+    if len(archived) > 0:
+        archive_dir = Path(vault_path) / "\u65e5\u5fd7" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        quarter = f"{datetime.date.today().year}Q{(datetime.date.today().month - 1) // 3 + 1}"
+        archive_file = archive_dir / f"\u76d1\u7763\u65e5\u5fd7-{quarter}.md"
+        with open(archive_file, "a", encoding="utf-8") as af:
+            af.write("\n".join(archived))
+        sup_log.write_text("\n".join(kept), "utf-8")
+        print(f"[weekly] Supervision log: {len(archived)} entries archived to {archive_file.name}")
 
 if __name__ == "__main__":
     main()
