@@ -515,7 +515,7 @@ If fails: "Missing Python dependency 'portalocker'. Run: `pip install portalocke
 
 **Step 4 — Check daemon status**
 ```bash
-# Check if obsidian_writer and supervisor are listening
+# Check if daily_refinement and supervisor are listening
 python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49520)); s.close(); print('writer OK')" 2>&1
 python -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',49522)); s.close(); print('supervisor OK')" 2>&1
 ```
