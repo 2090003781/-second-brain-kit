@@ -334,31 +334,17 @@ def extract_work_summary(cfg, ref_date):
     user_topics = []
     for f in sorted(dated_dir.glob("*.md")):
         for line in f.read_text("utf-8", errors="replace").split("\n"):
-            if "@event:UserPromptSubmit" in line and "|" in line:
-                idx = line.find("@event:")
+            if "@user_prompt" in line and "|" in line:
+                idx = line.find("@user_prompt")
                 if idx > 0:
                     content = line[:idx].strip()
-                    # Strip system text
-                    # Skip system messages
-                    skip_prefixes = ["<reasoning", "<response", "</", "可见推理", "Final answer", "：当模型"]
-                    if any(content.startswith(p) for p in skip_prefixes):
-                        continue
-                    for tag in ["<response-language>", "</response-language>", "<reasoning-language>", "</reasoning-language>"]:
-                        content = content.replace(tag, "")
+                    if " | @" in content:
+                        content = content.split(" | @")[0]
+                    elif " |" in content:
+                        content = content.rsplit(" |", 1)[0]
                     content = content.strip()
                     if len(content) > 3 and len(content) < 80:
                         user_topics.append(content)
-    
-    unique_topics = []
-    seen = set()
-    for t in user_topics:
-        if t.lower() not in seen:
-            seen.add(t.lower())
-            unique_topics.append(t)
-    if unique_topics:
-        work_items.append(f"话题: {', '.join(unique_topics[:5])}")
-        if len(unique_topics) > 5:
-            work_items[-1] += f" 等 {len(unique_topics)} 个"
     
     # Cluster into work items
     
@@ -484,7 +470,19 @@ def generate_report(cfg, ref_date, results):
     if prefs:
         lines.append("- \u4e60\u60ef: \u63d0\u70bc " + str(len(prefs)) + " \u6761")
     if not (errors or decisions or prefs):
-        lines.append("(\u65e0\u8bb0\u5f55)")
+        # Fallback: show work summary counts
+        work_items = extract_work_summary(cfg, ref_date)
+        counts = []
+        for item in work_items:
+            if "\u4f1a\u8bdd:" in item:
+                counts.append(item)
+            elif ":" in item:
+                counts.append(item)
+        if counts:
+            for c in counts:
+                lines.append("- " + c)
+        else:
+            lines.append("(\u65e0\u8bb0\u5f55)")
     lines.append("")
 
     lines.append("## \u9700\u5ba1\u6279")
