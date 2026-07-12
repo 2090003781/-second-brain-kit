@@ -275,6 +275,137 @@ def append_cases_to_errors(cfg, ref_date, cases):
         print(f"[daily] Error library: cases appended")
 
 
+def extract_work_summary(cfg, ref_date):
+    """Extract work content from reasonix-raw tool call logs."""
+    raw_dir = cfg["vault"] / "日志" / "reasonix-raw"
+    if not raw_dir.exists():
+        raw_dir = cfg["vault"] / "reasonix-raw"
+    dated_dir = raw_dir / ref_date
+    if not dated_dir.exists():
+        return []
+    
+    # Collect tool calls
+    tools = {}   # tool -> count
+    tool_targets = {}  # tool -> set of targets
+    write_targets = set()
+    edit_targets = set()
+    obsidian_writes = []
+    bash_cmds = []
+    session_count = 0
+    
+    for f in sorted(dated_dir.glob("*.md")):
+        session_count += 1
+        for line in f.read_text("utf-8", errors="replace").split("\n"):
+            if "@tool:" not in line or "|" not in line:
+                continue
+            parts = line.split("|")
+            # Extract tool name from tags
+            for part in parts:
+                p = part.strip()
+                if p.startswith("@tool:"):
+                    tool = p[6:].strip()
+                    tools[tool] = tools.get(tool, 0) + 1
+                    # Extract target from first content part
+                    content = parts[1].strip() if len(parts) > 1 else ""
+                    if tool == "write_file" and content:
+                        # Extract filename
+                        target = content.split()[-1] if content else ""
+                        target = target.split("/")[-1] if "/" in target else target
+                        if target:
+                            write_targets.add(target)
+                    elif tool == "edit_file" and content:
+                        target = content.split()[-1] if content else ""
+                        target = target.split("/")[-1] if "/" in target else target
+                        if target:
+                            edit_targets.add(target)
+                    elif tool.startswith("mcp__obsidian__write"):
+                        obsidian_writes.append(content[:50])
+                    elif tool == "bash" and content:
+                        # Extract brief cmd summary
+                        cmd = content.strip()
+                        if len(cmd) > 8:
+                            bash_cmds.append(cmd[:60])
+                    break
+    
+    # Initialize work items
+    work_items = []
+
+    # Collect user prompt topics
+    user_topics = []
+    for f in sorted(dated_dir.glob("*.md")):
+        for line in f.read_text("utf-8", errors="replace").split("\n"):
+            if "@event:UserPromptSubmit" in line and "|" in line:
+                idx = line.find("@event:")
+                if idx > 0:
+                    content = line[:idx].strip()
+                    # Strip system text
+                    # Skip system messages
+                    skip_prefixes = ["<reasoning", "<response", "</", "可见推理", "Final answer", "：当模型"]
+                    if any(content.startswith(p) for p in skip_prefixes):
+                        continue
+                    for tag in ["<response-language>", "</response-language>", "<reasoning-language>", "</reasoning-language>"]:
+                        content = content.replace(tag, "")
+                    content = content.strip()
+                    if len(content) > 3 and len(content) < 80:
+                        user_topics.append(content)
+    
+    unique_topics = []
+    seen = set()
+    for t in user_topics:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            unique_topics.append(t)
+    if unique_topics:
+        work_items.append(f"话题: {', '.join(unique_topics[:5])}")
+        if len(unique_topics) > 5:
+            work_items[-1] += f" 等 {len(unique_topics)} 个"
+    
+    # Cluster into work items
+    
+    # Group by domain
+    if session_count > 0:
+        work_items.append(f"会话: {session_count} 段")
+    
+    # Go/supervisor work
+    go_build = sum(1 for c in bash_cmds if "go build" in c)
+    go_compile = sum(1 for c in bash_cmds if "go build" in c or "supervisor" in c.lower())
+    if go_compile > 0:
+        work_items.append(f"小脑程序: 编译+部署 ({go_compile} 次)")
+    
+    # General bash work
+    if len(bash_cmds) > go_compile:
+        other_bash = len(bash_cmds) - go_compile
+        if other_bash >= 3:
+            work_items.append(f"执行操作: {other_bash} 次")
+    
+    # File modifications
+    all_writes = write_targets | edit_targets
+    if all_writes:
+        # Group by file type
+        py_files = [f for f in all_writes if f.endswith(".py")]
+        md_files = [f for f in all_writes if f.endswith(".md")]
+        toml_files = [f for f in all_writes if f.endswith(".toml")]
+        go_files = [f for f in all_writes if f.endswith(".go")]
+        other_files = [f for f in all_writes if not any(f.endswith(ext) for ext in [".py", ".md", ".toml", ".go"])]
+        
+        if go_files:
+            work_items.append(f"Go代码: 修改 {len(go_files)} 个文件")
+        if py_files:
+            work_items.append(f"Python脚本: 修改 {len(py_files)} 个文件")
+        if md_files:
+            work_items.append(f"Markdown笔记: 修改 {len(md_files)} 个文件")
+        if toml_files:
+            work_items.append(f"配置文件: 修改")
+        if other_files:
+            work_items.append(f"其他文件: {len(other_files)} 个")
+    
+    # Obsidian writes
+    if len(obsidian_writes) >= 2:
+        work_items.append(f"Vault笔记: 写入 {len(obsidian_writes)} 次")
+    
+    return work_items
+
+
 def generate_report(cfg, ref_date, results):
     """Generate clean daily report."""
     report_dir = cfg["daily_dir"]
@@ -288,14 +419,24 @@ def generate_report(cfg, ref_date, results):
     lines.append("# " + ref_date + " \u65e5\u62a5")
     lines.append("")
     lines.append("## \u5de5\u4f5c\u5185\u5bb9")
+    
+    # Primary: extract from tool call logs
+    work_items = extract_work_summary(cfg, ref_date)
+    
+    # Secondary: also include DECISION markers if any
     has_work = set()
     for d in decisions:
         s = d["groups"][0][:80] if d["groups"] and d["groups"][0] else ""
         if s:
             has_work.add(s)
-    for w in sorted(has_work):
-        lines.append("- " + w)
-    if not has_work:
+    all_items = sorted(has_work)
+    
+    if work_items or all_items:
+        for item in work_items:
+            lines.append("- " + item)
+        for w in all_items:
+            lines.append("- " + w)
+    else:
         lines.append("(\u65e0\u8bb0\u5f55)")
     lines.append("")
 
