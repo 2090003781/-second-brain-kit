@@ -199,7 +199,7 @@ def scan_failed_cases(cfg, ref_date):
         return []
     result = subprocess.run(
         ["rg", "--no-heading", "-n", "@status:failed", str(dated_dir)],
-        capture_output=True, text=True
+        capture_output=True, text=True, encoding="utf-8"
     )
     if result.returncode != 0:
         return []
