@@ -113,9 +113,10 @@ def parse_entry_line(line: str, ref_date: str) -> dict | None:
 
 
 def scan_topics(cfg, ref_date):
-    """Scan reasonix-raw, supervision log, and JSONL logs for structured markers."""
+    """Scan reasonix-raw, supervision log, and JSONL logs for structured markers (including modern @tag format from writer.go)."""
     import json as _json
     results = {"DECISION": [], "ERROR": [], "PREFERENCE": [], "PENDING": [], "TRIGGER": []}
+    modern_markers = 0
     
     # 1. Scan reasonix-raw directory (now under 日志/)
     raw_dir = cfg["vault"] / "日志" / "reasonix-raw"
@@ -129,6 +130,14 @@ def scan_topics(cfg, ref_date):
             for f in sorted(dated_dir.glob("*.md")):
                 text = f.read_text("utf-8", errors="replace")
                 for line in text.split("\n"):
+                    # Count modern @tag markers
+                    if "@event:UserPromptSubmit" in line:
+                        modern_markers += 1
+                        results["DECISION"].append({"type":"DECISION","groups":("提问",None,None),"raw":line})
+                    elif "@status:failed" in line:
+                        modern_markers += 1
+                        results["ERROR"].append({"type":"ERROR","groups":("操作失败",None,None,None),"raw":line})
+                    # Legacy format markers
                     entry = parse_entry_line(line, ref_date)
                     if entry: results[entry["type"]].append(entry)
                     # Also check for raw marker format: 时间 | [DECISION: ...]
@@ -185,7 +194,7 @@ def scan_topics(cfg, ref_date):
                 results["ERROR"].append({"type":"ERROR","groups":(line[:120],None,None,None),"raw":line})
     
 
-    return results
+    return results, modern_markers
 
 
 def scan_failed_cases(cfg, ref_date):
@@ -346,48 +355,62 @@ def extract_work_summary(cfg, ref_date):
                     if len(content) > 3 and len(content) < 80:
                         user_topics.append(content)
     
-    # Cluster into work items
+    # Use user prompt topics as primary work content
+    if user_topics:
+        # Cluster by topic similarity
+        seen_items = set()
+        for t in user_topics:
+            # Skip very short or system-like prompts
+            if len(t) < 5 or "language" in t.lower() or "preference" in t.lower():
+                continue
+            # Normalize: trim to first 40 chars and dedup
+            key = t[:40].lower()
+            if key not in seen_items:
+                seen_items.add(key)
+                work_items.append(t[:60])
     
-    # Group by domain
-    if session_count > 0:
-        work_items.append(f"会话: {session_count} 段")
-    
-    # Go/supervisor work
-    go_build = sum(1 for c in bash_cmds if "go build" in c)
-    go_compile = sum(1 for c in bash_cmds if "go build" in c or "supervisor" in c.lower())
-    if go_compile > 0:
-        work_items.append(f"小脑程序: 编译+部署 ({go_compile} 次)")
-    
-    # General bash work
-    if len(bash_cmds) > go_compile:
-        other_bash = len(bash_cmds) - go_compile
-        if other_bash >= 3:
-            work_items.append(f"执行操作: {other_bash} 次")
-    
-    # File modifications
-    all_writes = write_targets | edit_targets
-    if all_writes:
-        # Group by file type
-        py_files = [f for f in all_writes if f.endswith(".py")]
-        md_files = [f for f in all_writes if f.endswith(".md")]
-        toml_files = [f for f in all_writes if f.endswith(".toml")]
-        go_files = [f for f in all_writes if f.endswith(".go")]
-        other_files = [f for f in all_writes if not any(f.endswith(ext) for ext in [".py", ".md", ".toml", ".go"])]
+    # If no user topics, fall back to tool stats
+    if not work_items:
+        # Group by domain
+        if session_count > 0:
+            work_items.append(f"会话: {session_count} 段")
         
-        if go_files:
-            work_items.append(f"Go代码: 修改 {len(go_files)} 个文件")
-        if py_files:
-            work_items.append(f"Python脚本: 修改 {len(py_files)} 个文件")
-        if md_files:
-            work_items.append(f"Markdown笔记: 修改 {len(md_files)} 个文件")
-        if toml_files:
-            work_items.append(f"配置文件: 修改")
-        if other_files:
-            work_items.append(f"其他文件: {len(other_files)} 个")
-    
-    # Obsidian writes
-    if len(obsidian_writes) >= 2:
-        work_items.append(f"Vault笔记: 写入 {len(obsidian_writes)} 次")
+        # Go/supervisor work
+        go_build = sum(1 for c in bash_cmds if "go build" in c)
+        go_compile = sum(1 for c in bash_cmds if "go build" in c or "supervisor" in c.lower())
+        if go_compile > 0:
+            work_items.append(f"小脑程序: 编译+部署 ({go_compile} 次)")
+        
+        # General bash work
+        if len(bash_cmds) > go_compile:
+            other_bash = len(bash_cmds) - go_compile
+            if other_bash >= 3:
+                work_items.append(f"执行操作: {other_bash} 次")
+        
+        # File modifications
+        all_writes = write_targets | edit_targets
+        if all_writes:
+            # Group by file type
+            py_files = [f for f in all_writes if f.endswith(".py")]
+            md_files = [f for f in all_writes if f.endswith(".md")]
+            toml_files = [f for f in all_writes if f.endswith(".toml")]
+            go_files = [f for f in all_writes if f.endswith(".go")]
+            other_files = [f for f in all_writes if not any(f.endswith(ext) for ext in [".py", ".md", ".toml", ".go"])]
+            
+            if go_files:
+                work_items.append(f"Go\u4ee3\u7801: \u4fee\u6539 {len(go_files)} \u4e2a\u6587\u4ef6")
+            if py_files:
+                work_items.append(f"Python\u811a\u672c: \u4fee\u6539 {len(py_files)} \u4e2a\u6587\u4ef6")
+            if md_files:
+                work_items.append(f"Markdown\u7b14\u8bb0: \u4fee\u6539 {len(md_files)} \u4e2a\u6587\u4ef6")
+            if toml_files:
+                work_items.append(f"\u914d\u7f6e\u6587\u4ef6: \u4fee\u6539")
+            if other_files:
+                work_items.append(f"\u5176\u4ed6\u6587\u4ef6: {len(other_files)} \u4e2a")
+        
+        # Obsidian writes
+        if len(obsidian_writes) >= 2:
+            work_items.append(f"Vault\u7b14\u8bb0: \u5199\u5165 {len(obsidian_writes)} \u6b21")
     
     return work_items
 
@@ -433,32 +456,21 @@ def generate_report(cfg, ref_date, results):
         todo_items = []
         for line in todo_path.read_text("utf-8").split("\n"):
             s = line.strip()
-            if s.startswith("- [x]") or s.startswith("- [X]"):
-                title = s[6:].split("\u2014")[0].strip().strip("*").strip()
-                # Extract @start date
-                start_m = re.search(r"@start:(\S+)", s)
-                start_date = start_m.group(1) if start_m else ""
-                todo_items.append(("done", title, start_date, s))
-            elif s.startswith("- [ ]") and len(s) > 6:
+            if s.startswith("- [ ]") and len(s) > 6:
                 title = s[6:].split("\u2014")[0].strip().strip("*").strip()
                 start_m = re.search(r"@start:(\S+)", s)
                 active_m = re.search(r"@active:(\S+)", s)
                 start_date = start_m.group(1) if start_m else ""
                 active_date = active_m.group(1) if active_m else ""
-                todo_items.append(("pending", title, start_date, active_date, s))
-        pending_list = [(t, sd, ad) for item in todo_items if item[0] == "pending" for t, sd, ad in [(item[1], item[2], item[3])]]
-        done_list = [(t, sd) for item in todo_items if item[0] == "done" for t, sd in [(item[1], item[2])]]
-        # Sort pending by @active desc (most recent first)
-        pending_list.sort(key=lambda x: x[2] if x[2] else "", reverse=True)
-        for t, sd, ad in pending_list:
+                todo_items.append((title, start_date, active_date))
+        # Sort by @active desc (most recent first)
+        todo_items.sort(key=lambda x: x[2] if x[2] else "", reverse=True)
+        for t, sd, ad in todo_items:
             display = "  - [ ] " + t
             if sd:
                 display += " (" + sd + ")"
             lines.append(display)
-        for t, sd in done_list:
-            display = "  - [x] " + t
-            lines.append(display)
-        if not pending_list and not done_list:
+        if not todo_items:
             lines.append("  (\u65e0)")
     lines.append("")
 
@@ -566,10 +578,10 @@ def main():
     cfg = load_config()
     ref_date = args.date or (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
-    results = scan_topics(cfg, ref_date)
+    results, modern_markers = scan_topics(cfg, ref_date)
     total = sum(len(v) for v in results.values())
 
-    print(f"[daily] {ref_date}: {total} markers in topic files")
+    print(f"[daily] {ref_date}: {total} markers ({modern_markers} modern @tags)")
     for k, v in results.items():
         print(f"  {k}: {len(v)}")
 
