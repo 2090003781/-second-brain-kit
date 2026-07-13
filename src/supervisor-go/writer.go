@@ -187,6 +187,17 @@ func writeRawEvent(date, ts string, evt *writerEvent) {
 		line = fmt.Sprintf("%s | ■ 会话结束%s\n", timeStr, tags)
 	case "UserPromptSubmit":
 		p := evt.Prompt
+		// Strip Reasonix system directives
+		re := regexp.MustCompile("(?s)<[^>]+>")
+		p = re.ReplaceAllString(p, "")
+		for _, prefix := range []string{"可见推理", "Final answer", "reasoning-language", "response-language"} {
+			if idx := strings.Index(p, prefix); idx >= 0 {
+				if end := strings.Index(p[idx:], "\n"); end > 0 {
+					p = p[idx+end:]
+				}
+			}
+		}
+		p = strings.TrimSpace(p)
 		if len(p) > 150 { p = p[:150] }
 		line = fmt.Sprintf("%s | %s%s\n", timeStr, p, tags)
 	case "PreToolUse":
@@ -230,6 +241,10 @@ func buildTags(evt *writerEvent) string {
 	// Event type tag
 	if evt.Event != "" {
 		tags = append(tags, "@event:"+evt.Event)
+		// User prompt tag for easy extraction
+		if evt.Event == "UserPromptSubmit" {
+			tags = append(tags, "@user_prompt")
+		}
 	}
 
 	// Tool name tag
